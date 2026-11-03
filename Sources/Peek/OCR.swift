@@ -1,0 +1,357 @@
+import AppKit
+import Vision
+
+/// 文字识别：Vision 的 VNRecognizeTextRequest。
+///
+/// 几个实践要点：
+/// - `.accurate` 比 `.fast` 慢 2~3 倍，但小字、中文、混排的准确率差距很大，翻译场景必须用 accurate。
+/// - 语言顺序有讲究：`["zh-Hans", "en-US"]` 表示优先按简体中文识别，
+///   纯英文区域仍会正确识别成英文（Vision 会自动判语种），但中英混排时不会把汉字认成乱码。
+/// - Vision 返回的 boundingBox 是左下原点归一化坐标，需要转成"从上到下、从左到右"的阅读顺序。
+/// - Vision 对**输入像素尺寸**很敏感：一行十几 px 高的字（终端、小字号 UI）识别率断崖式下跌。
+///   放大 + 灰度化 + 反色（深色主题）+ 对比度拉伸能显著救回来，见 `prepared(_:)`。
+enum OCR {
+
+    struct Result {
+        let lines: [String]
+        /// 保留换行，用于 OCR 模式展示
+        let text: String
+        /// 拼成段落，用于翻译
+        let paragraph: String
+        let confidence: Float
+        let elapsed: Int
+        /// 实际走的路径，用于自检对照（"原图" / "增强"）
+        let variant: String
+    }
+
+    enum OCRError: LocalizedError {
+        case imageUnreadable
+        case noText
+        case failed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .imageUnreadable: return "图片读不出来。"
+            case .noText: return "这块区域里没有识别到文字。"
+            case .failed(let msg): return "文字识别失败：\(msg)"
+            }
+        }
+    }
+
+    enum Enhance {
+        /// 小图直接增强；大图先认原图，置信度不理想再增强重认并取优
+        case auto
+        /// 一律只用原图
+        case off
+        /// 一律强制增强
+        case force
+    }
+
+    /// 同步识别。调用方负责放到后台队列（大图耗时几十到几百毫秒）。
+    static func recognize(_ image: CGImage,
+                         languages: [String] = ["zh-Hans", "en-US"],
+                         enhance: Enhance = .auto) throws -> Result {
+        let start = Date()
+        let plainVariant = "原图"
+        let boostedVariant = "增强"
+
+        switch enhance {
+        case .off:
+            return try run(image, languages: languages, origin: start, variant: plainVariant)
+
+        case .force:
+            if let boosted = prepared(image),
+               let result = try? run(boosted, languages: languages, origin: start, variant: boostedVariant) {
+                return result
+            }
+            return try run(image, languages: languages, origin: start, variant: plainVariant)
+
+        case .auto:
+            // 两路都跑，按"行数"选优。
+            //
+            // 为什么不用 Vision 的置信度做裁判：实测不可靠。等宽终端字那一组，
+            // 增强版置信度 0.50 高于原图 0.43，但内容把 `load` 认成 `1oad`、`0.93` 认成 `8.93`。
+            // 而小字号中文那一组正相反：原图整行漏掉（2 行），增强版 3 行全出。
+            //
+            // 取舍：漏一整行比个别字母错（`l`→`1`）严重得多 —— 漏行会让译文丢信息，
+            // 错字母多数能被翻译模型纠正。所以行数多的赢，行数打平则用原图（少一层插值噪声）。
+            var plain: Result?
+            var plainError: Error?
+            do {
+                plain = try run(image, languages: languages, origin: start, variant: plainVariant)
+            } catch {
+                plainError = error
+            }
+
+            // 整屏大图且原图已经认得不错：不做增强，省一次几百毫秒
+            if let plain, max(image.width, image.height) >= 1600, plain.confidence >= 0.7 {
+                return plain
+            }
+
+            guard let boosted = prepared(image),
+                  let alternative = try? run(boosted, languages: languages,
+                                             origin: start, variant: boostedVariant) else {
+                if let plain { return plain }
+                throw plainError ?? OCRError.noText
+            }
+
+            guard let plain else {
+                Log.info("OCR: 原图无结果，采用增强结果")
+                return alternative
+            }
+
+            if alternative.lines.count > plain.lines.count {
+                Log.info("OCR: 增强多认出 \(alternative.lines.count - plain.lines.count) 行，采用增强结果")
+                return alternative
+            }
+            return plain
+        }
+    }
+
+    /// 预热：首次调用 Vision 要加载模型，实测冷启动 15 秒、热态 190ms。
+    /// 启动后后台跑一次空识别，把模型留在内存里，第一次截图才不用等。
+    static func prewarm() {
+        DispatchQueue.global(qos: .utility).async {
+            guard let context = CGContext(data: nil, width: 8, height: 8,
+                                          bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpaceCreateDeviceGray(),
+                                          bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
+            context.setFillColor(gray: 1, alpha: 1)
+            context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+            guard let image = context.makeImage() else { return }
+            let start = Date()
+            _ = try? recognize(image, enhance: .off)
+            Log.info("OCR: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms")
+        }
+    }
+
+    // MARK: - 预处理
+
+    /// 把图变成更适合 Vision 的样子：
+    /// 1. 转灰度（彩色底纹 / 抗锯齿彩边会干扰识别）；
+    /// 2. 深底浅字自动反色 —— 深色主题截图里 Vision 经常整段漏掉；
+    /// 3. 动态范围不足时做百分位拉伸（2%~98%），把灰底灰字拉开；
+    /// 4. 小图放大（短边 < 240 用 3×、< 640 用 2×，其余 1.5×），上限 1600 万像素。
+    ///
+    /// 注意**不做硬二值化**：二值化会把抗锯齿边缘吃成锯齿，中文笔画粘连，
+    /// Vision 的识别率反而下降。拉伸已经能拿到同等收益。
+    ///
+    /// - Parameter upscale: 传 nil 用自动策略；传具体倍数供自检做对照实验。
+    static func prepared(_ image: CGImage, upscale: CGFloat? = nil) -> CGImage? {
+        let width = image.width
+        let height = image.height
+        guard width >= 8, height >= 8 else { return nil }
+        let count = width * height
+
+        guard let gray = CGContext(data: nil, width: width, height: height,
+                                   bitsPerComponent: 8, bytesPerRow: width,
+                                   space: CGColorSpaceCreateDeviceGray(),
+                                   bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return nil }
+        gray.interpolationQuality = .high
+        gray.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let raw = gray.data else { return nil }
+        let bytes = raw.bindMemory(to: UInt8.self, capacity: count)
+
+        var histogram = [Int](repeating: 0, count: 256)
+        var sum = 0
+        for index in 0..<count {
+            let value = Int(bytes[index])
+            histogram[value] += 1
+            sum += value
+        }
+        let mean = Double(sum) / Double(count)
+
+        func percentile(_ ratio: Double) -> Int {
+            let target = Int(Double(count) * ratio)
+            var accumulated = 0
+            for value in 0..<256 {
+                accumulated += histogram[value]
+                if accumulated >= target { return value }
+            }
+            return 255
+        }
+
+        let low = percentile(0.02)
+        let high = percentile(0.98)
+        let span = high - low
+        let invert = mean < 100                 // 深底浅字
+        // 动态范围已经很满（照片、彩色 UI）就别拉伸了，只会把噪点放大
+        let stretch = span >= 24 && span < 200
+
+        if invert || stretch {
+            for index in 0..<count {
+                var value = Int(bytes[index])
+                if stretch {
+                    value = (value - low) * 255 / span
+                    value = min(255, max(0, value))
+                }
+                if invert { value = 255 - value }
+                bytes[index] = UInt8(value)
+            }
+        }
+
+        let shortSide = min(width, height)
+        // 实测：1× 不放大时深色小图只认出 1 行（340×96 的深底样本），2× 起才正常，
+        // 说明小图的瓶颈是像素密度而不是对比度。倍数按短边分档。
+        var scale: CGFloat = upscale ?? (shortSide < 200 ? 3 : (shortSide < 700 ? 2 : 1.5))
+        while CGFloat(width) * scale * CGFloat(height) * scale > 16_000_000, scale > 1 {
+            scale *= 0.8
+        }
+
+        guard let processed = gray.makeImage() else { return nil }
+        guard scale > 1.01 else { return processed }
+
+        let outWidth = Int((CGFloat(width) * scale).rounded())
+        let outHeight = Int((CGFloat(height) * scale).rounded())
+        guard let up = CGContext(data: nil, width: outWidth, height: outHeight,
+                                 bitsPerComponent: 8, bytesPerRow: outWidth,
+                                 space: CGColorSpaceCreateDeviceGray(),
+                                 bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return processed }
+        up.interpolationQuality = .high
+        up.draw(processed, in: CGRect(x: 0, y: 0, width: outWidth, height: outHeight))
+
+        Log.info("OCR: 预处理 \(width)×\(height) → \(outWidth)×\(outHeight) 反色=\(invert) 拉伸=\(stretch ? "\(low)~\(high)" : "否")")
+        return up.makeImage() ?? processed
+    }
+
+    // MARK: - 识别
+
+    static func run(_ image: CGImage,
+                    languages: [String] = ["zh-Hans", "en-US"],
+                    origin: Date = Date(),
+                    variant: String) throws -> Result {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.recognitionLanguages = languages
+        // 关闭自动语种检测：开了以后会忽略我们指定的顺序，中文小字容易掉
+        request.automaticallyDetectsLanguage = false
+
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            throw OCRError.failed(error.localizedDescription)
+        }
+
+        let observations = (request.results ?? []).compactMap { $0 as? VNRecognizedTextObservation }
+        guard !observations.isEmpty else { throw OCRError.noText }
+
+        // 按视觉行聚类。
+        // 早先按 maxY 取整分桶，结果同一行被拆成两半（"UNet子" / "图"）——
+        // 两段文字的 maxY 只要差一点点就会落到不同桶里。改成纵向重叠判定：
+        // 与当前行的纵向区间重叠超过半行高，就算同一行。
+        struct Line {
+            var band: (minY: CGFloat, maxY: CGFloat)
+            var items: [(minX: CGFloat, text: String, confidence: Float)]
+        }
+
+        var lines: [Line] = []
+        for obs in observations {
+            guard let candidate = obs.topCandidates(1).first else { continue }
+            let box = obs.boundingBox        // 左下原点归一化
+            let minY = box.minY
+            let maxY = box.maxY
+            let height = maxY - minY
+
+            if let index = lines.firstIndex(where: { line in
+                let overlap = min(line.band.maxY, maxY) - max(line.band.minY, minY)
+                let smaller = min(line.band.maxY - line.band.minY, height)
+                // 中文单字（"图"）高度极小，用 40% 阈值太严，取两者较小高度的一半
+                return smaller > 0 && overlap > smaller * 0.5
+            }) {
+                lines[index].items.append((box.minX, candidate.string, candidate.confidence))
+                lines[index].band.minY = min(lines[index].band.minY, minY)
+                lines[index].band.maxY = max(lines[index].band.maxY, maxY)
+            } else {
+                lines.append(Line(band: (minY, maxY),
+                                  items: [(box.minX, candidate.string, candidate.confidence)]))
+            }
+        }
+
+        // 行从上到下（maxY 大在上），行内从左到右
+        lines.sort { $0.band.maxY > $1.band.maxY }
+
+        var texts: [String] = []
+        var confidences: [Float] = []
+        for line in lines {
+            let ordered = line.items.sorted { $0.minX < $1.minX }
+            let joined = joinInline(ordered.map { ($0.minX, $0.text) })
+            guard !joined.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            texts.append(joined)
+            confidences.append(contentsOf: ordered.map(\.confidence))
+        }
+        guard !texts.isEmpty else { throw OCRError.noText }
+
+        let average = confidences.isEmpty ? 0 : confidences.reduce(0, +) / Float(confidences.count)
+
+        let result = Result(
+            lines: texts,
+            text: texts.joined(separator: "\n"),
+            paragraph: joinAsParagraph(texts),
+            confidence: average,
+            elapsed: Int(-origin.timeIntervalSinceNow * 1000),
+            variant: variant
+        )
+        Log.info("OCR[\(variant)]: \(texts.count) 行 / 置信度 \(String(format: "%.2f", average)) / \(result.elapsed)ms → \(result.text.prefix(40).replacingOccurrences(of: "\n", with: " / "))")
+        return result
+    }
+
+    /// 同一行内的碎片拼接。中文之间不加空格，拉丁文之间补一个。
+    private static func joinInline(_ fragments: [(x: CGFloat, text: String)]) -> String {
+        var out = ""
+        for fragment in fragments {
+            let piece = fragment.text
+            guard !piece.isEmpty else { continue }
+            if out.isEmpty {
+                out = piece
+                continue
+            }
+            let lastCJK = out.unicodeScalars.last.map(isCJK) ?? false
+            let firstCJK = piece.unicodeScalars.first.map(isCJK) ?? false
+            out += (lastCJK || firstCJK) ? piece : " " + piece
+        }
+        return out
+    }
+
+    /// 把逐行结果拼回段落：
+    /// 中文行之间不加空格（加了反而别扭），英文行之间补一个空格。
+    private static func joinAsParagraph(_ lines: [String]) -> String {
+        var out = ""
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+            if out.isEmpty {
+                out = trimmed
+                continue
+            }
+            let lastChar = out.unicodeScalars.last
+            let firstChar = trimmed.unicodeScalars.first
+            let lastIsCJK = lastChar.map(isCJK) ?? false
+            let firstIsCJK = firstChar.map(isCJK) ?? false
+            // 行尾连字符表示这个词被拆开了，接上不要留空格
+            if lastChar == "-" {
+                out.removeLast()
+                out += trimmed
+            } else if lastIsCJK || firstIsCJK {
+                out += trimmed
+            } else {
+                out += " " + trimmed
+            }
+        }
+        return out
+    }
+
+    private static func isCJK(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x4E00...0x9FFF, 0x3400...0x4DBF,      // 汉字
+             0x3000...0x303F,                        // 中文标点
+             0xFF00...0xFFEF,                        // 全角
+             0x3040...0x30FF,                        // 假名
+             0xAC00...0xD7AF:                        // 谚文
+            return true
+        default:
+            return false
+        }
+    }
+}

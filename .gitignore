@@ -1,0 +1,10 @@
+.build/
+dist/
+build/
+*.xcodeproj
+.DS_Store
+
+# 签名私钥材料：由 tools/signing/make_cert.sh 现生成，绝不入库
+tools/signing/key.pem
+tools/signing/cert.pem
+tools/signing/identity.p12
