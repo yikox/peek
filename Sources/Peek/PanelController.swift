@@ -23,7 +23,7 @@ final class PanelController: NSObject {
     // 顶部条
     private let topBar = NSView()
     private let engineControl = MenuControl(frame: .zero)
-    private let settingsButton = NSButton()
+    private let pinButton = NSButton()
     private let closeButton = NSButton()
 
     // 查询区
@@ -56,6 +56,8 @@ final class PanelController: NSObject {
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var isShowing = false
+    /// 钉住：点面板外面不再自动收起，只有 Esc / 关闭按钮 / 再按一次热键才收
+    private var isPinned = false
     private var lastShownAt = Date.distantPast
     private var permissionWatcher: Timer?
     private var permissionTicks = 0
@@ -112,10 +114,11 @@ final class PanelController: NSObject {
         engineControl.toolTip = "切换翻译引擎（离线翻译 / OpenAI 兼容 / Mock）"
         rebuildEngineMenu()
 
-        configure(icon: settingsButton, symbol: "gearshape", action: #selector(openSettings))
+        configure(icon: pinButton, symbol: "pin", action: #selector(togglePin))
+        pinButton.toolTip = "固定面板：点外面不自动收起"
         configure(icon: closeButton, symbol: "xmark", action: #selector(closePanel))
 
-        topBar.addSubview(settingsButton)
+        topBar.addSubview(pinButton)
         topBar.addSubview(closeButton)
     }
 
@@ -216,7 +219,7 @@ final class PanelController: NSObject {
         engineControl.frame = NSRect(x: 0, y: 0, width: 120, height: Metrics.topBarH)
         let buttonY: CGFloat = 1
         closeButton.frame = NSRect(x: Metrics.contentW - 22, y: buttonY, width: 22, height: 22)
-        settingsButton.frame = NSRect(x: Metrics.contentW - 22 - 6 - 22, y: buttonY, width: 22, height: 22)
+        pinButton.frame = NSRect(x: Metrics.contentW - 22 - 6 - 22, y: buttonY, width: 22, height: 22)
 
         let cardH = Metrics.whiteCardH
         whiteCard.frame = NSRect(x: M,
@@ -494,6 +497,12 @@ final class PanelController: NSObject {
     func hide() {
         guard isShowing else { return }
         isShowing = false
+        // 收起时清掉固定状态：下次唤起默认还是「点外面就收」，
+        // 否则用户会以为面板坏了（点哪都不走）
+        if isPinned {
+            isPinned = false
+            refreshPinButton()
+        }
         stopPermissionWatch()
         removeMonitors()
         seed += 1 // 丢弃尚未回来的请求
@@ -508,7 +517,7 @@ final class PanelController: NSObject {
                 guard let self else { return }
                 // 刚显示时的同一次点击不要算作"点外面"
                 if Date().timeIntervalSince(self.lastShownAt) < 0.2 { return }
-                self.hide()
+                self.handleOutsideClick()
             }
         }
         if localMonitor == nil {
@@ -526,6 +535,13 @@ final class PanelController: NSObject {
                 return event
             }
         }
+    }
+
+    /// 点到面板外面。抽成方法是为了让自检能覆盖这条判断本身，
+    /// 而不只是验证图钉图标有没有变蓝。
+    private func handleOutsideClick() {
+        if isPinned { return }
+        hide()
     }
 
     private func removeMonitors() {
@@ -693,9 +709,20 @@ final class PanelController: NSObject {
         pasteboard.setString(text, forType: .string)
     }
 
-    @objc private func openSettings() {
-        hide()
-        SettingsWindow.shared.show()
+    /// 钉住 / 取消钉住。钉住之后点面板外面不再收起，
+    /// 适合对照着原文慢慢改，或者拿面板当参照物看别的窗口。
+    @objc private func togglePin() {
+        isPinned.toggle()
+        refreshPinButton()
+        Log.info("面板固定: \(isPinned ? "开" : "关")")
+    }
+
+    private func refreshPinButton() {
+        pinButton.image = NSImage(systemSymbolName: isPinned ? "pin.fill" : "pin",
+                                  accessibilityDescription: isPinned ? "已固定" : "固定面板")?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+        pinButton.contentTintColor = isPinned ? Theme.accent : Theme.secondary
+        pinButton.toolTip = isPinned ? "已固定：点外面不会收起" : "固定面板：点外面不自动收起"
     }
 
     @objc private func closePanel() {
@@ -735,6 +762,22 @@ final class PanelController: NSObject {
             resultCopyBadge.performClick(nil)
         }
         return NSPasteboard.general.string(forType: .string) ?? "<剪贴板为空>"
+    }
+
+    /// 供 --snapshot 渲染「已固定」状态的图钉外观
+    func debugSetPinned(_ on: Bool) {
+        isPinned = on
+        refreshPinButton()
+    }
+
+    var debugIsPinned: Bool { isPinned }
+
+    func debugClickPin() { pinButton.performClick(nil) }
+
+    /// 走一遍「点外面」的真实判断，返回面板是否还留在屏幕上
+    func debugOutsideClick() -> Bool {
+        handleOutsideClick()
+        return debugIsVisible
     }
 
     func debugUseMockEngine() {

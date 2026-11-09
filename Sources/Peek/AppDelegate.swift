@@ -166,6 +166,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.info("复制自检[\(target)]: 剪贴板 → \(got.prefix(60))")
         }
 
+        // 图钉自检：走真实按钮的 performClick，验证「点一下翻状态」这条链路
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.selftestPin"),
+            object: nil,
+            queue: .main
+        ) { _ in
+            let c = PanelController.shared
+            c.showInput()
+            c.debugClickPin()
+            let clickWorked = c.debugIsPinned
+            let keptWhenPinned = c.debugOutsideClick()
+            c.debugClickPin()
+            let keptWhenFree = c.debugOutsideClick()
+            Log.info("图钉自检: 点击翻转=\(clickWorked ? "ok" : "FAIL")；钉住时点外面→\(keptWhenPinned ? "仍显示" : "被收起")；未钉住时点外面→\(keptWhenFree ? "仍显示" : "被收起")")
+        }
+
         // 外部触发授权引导：弹系统的辅助功能授权框
         DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.peek.translator.requestAccessibility"),

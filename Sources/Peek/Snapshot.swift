@@ -23,6 +23,9 @@ enum Snapshot {
 
         let controller = PanelController.shared
         controller.prepareSnapshot(output: sample())
+        if CommandLine.arguments.contains("--pinned") {
+            controller.debugSetPinned(true)
+        }
 
         let view = controller.snapshotView()
         render(view, to: path)
