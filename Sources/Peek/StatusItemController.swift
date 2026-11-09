@@ -1,11 +1,13 @@
 import AppKit
 import ServiceManagement
 
-final class StatusItemController: NSObject {
+final class StatusItemController: NSObject, NSMenuDelegate {
 
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var launchAtLoginItem: NSMenuItem?
     private var prewarmOCRItem: NSMenuItem?
+    /// 动作菜单项与其对应动作，菜单每次打开时按当前配置刷新快捷键
+    private var actionItems: [(HotKeyAction, NSMenuItem)] = []
 
     override init() {
         super.init()
@@ -34,11 +36,22 @@ final class StatusItemController: NSObject {
 
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(makeItem("输入翻译", action: #selector(showInput), key: "f", modifiers: [.option]))
-        menu.addItem(makeItem("划词翻译", action: #selector(translateSelection), key: "d", modifiers: [.option]))
-        menu.addItem(makeItem("截图翻译", action: #selector(screenshotTranslate), key: "s", modifiers: [.option]))
-        menu.addItem(makeItem("截图 OCR", action: #selector(screenshotOCR), key: "a", modifiers: [.option]))
-        menu.addItem(makeItem("翻译剪贴板", action: #selector(translateClipboard), key: "v", modifiers: [.option]))
+        menu.delegate = self
+
+        // 动作顺序按使用频率排，快捷键在 menuWillOpen 里按当前配置填
+        let order: [HotKeyAction] = [.input, .selection, .capture,
+                                     .screenshotTranslate, .screenshotOCR,
+                                     .clipboard, .togglePanel]
+        for action in order {
+            let menuItem = NSMenuItem(title: action.title,
+                                      action: #selector(runAction(_:)),
+                                      keyEquivalent: "")
+            menuItem.target = self
+            menuItem.representedObject = action.rawValue
+            menu.addItem(menuItem)
+            actionItems.append((action, menuItem))
+        }
+
         menu.addItem(.separator())
         menu.addItem(makeItem("设置…", action: #selector(openSettings), key: ",", modifiers: [.command]))
         menu.addItem(makeItem("检查辅助功能权限", action: #selector(checkPermission), key: "", modifiers: []))
@@ -65,26 +78,36 @@ final class StatusItemController: NSObject {
         return menuItem
     }
 
+    /// 菜单一打开就按当前配置刷新：用户在设置里改完键位，这里立刻跟着变
+    func menuWillOpen(_ menu: NSMenu) {
+        for (action, menuItem) in actionItems {
+            menuItem.title = action.title
+            guard let combo = HotKeyStore.combo(for: action) else {
+                menuItem.keyEquivalent = ""
+                menuItem.keyEquivalentModifierMask = []
+                continue
+            }
+            let key = combo.menuKeyEquivalent
+            if key.isEmpty {
+                // F1 / 方向键这类没法当 keyEquivalent，写进标题里
+                menuItem.keyEquivalent = ""
+                menuItem.keyEquivalentModifierMask = []
+                menuItem.title = "\(action.title)　\(combo.display)"
+            } else {
+                menuItem.keyEquivalent = key
+                menuItem.keyEquivalentModifierMask = combo.eventModifiers
+            }
+        }
+        launchAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        prewarmOCRItem?.state = PrefKey.prewarmOCRDefault ? .on : .off
+    }
+
     // MARK: - 动作
 
-    @objc private func showInput() {
-        PanelController.shared.showInput()
-    }
-
-    @objc private func translateSelection() {
-        PanelController.shared.showWithSelection()
-    }
-
-    @objc private func translateClipboard() {
-        PanelController.shared.showFromClipboard()
-    }
-
-    @objc private func screenshotTranslate() {
-        PanelController.shared.showScreenshot(.translate)
-    }
-
-    @objc private func screenshotOCR() {
-        PanelController.shared.showScreenshot(.ocr)
+    @objc private func runAction(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let action = HotKeyAction(rawValue: raw) else { return }
+        action.perform()
     }
 
     /// 屏幕录制授权后必须重启进程才生效，给个一键重启。

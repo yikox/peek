@@ -3,6 +3,15 @@ import AppKit
 enum ScreenshotMode {
     case translate   // 框选 → OCR → 翻译
     case ocr         // 框选 → 只 OCR
+    case capture     // 框选 → 弹缩略图，复制 / 保存 / 识别随用户选
+
+    var label: String {
+        switch self {
+        case .translate: return "翻译"
+        case .ocr: return "OCR"
+        case .capture: return "截图"
+        }
+    }
 }
 
 /// 截图取词：冻结当前屏幕 → 全屏遮罩上拖框 → 裁剪 → OCR。
@@ -18,6 +27,8 @@ final class ScreenshotController {
 
     private var window: ScreenshotWindow?
     private var isActive = false
+    /// 框选要抢焦点（makeKey），记下抢之前是谁在前台，截完还回去
+    private var previousApp: NSRunningApplication?
 
     private init() {}
 
@@ -36,6 +47,7 @@ final class ScreenshotController {
         }
 
         isActive = true
+        previousApp = NSWorkspace.shared.frontmostApplication
         PanelController.shared.hide()
 
         let overlay = ScreenshotWindow(screen: screen, image: frozen)
@@ -48,9 +60,10 @@ final class ScreenshotController {
         overlay.onCancel = { [weak self] in
             Log.info("截图: 已取消")
             self?.teardown()
+            self?.restorePreviousApp()
         }
         overlay.present()
-        Log.info("截图: 遮罩已显示 \(Int(screen.frame.width))×\(Int(screen.frame.height))pt @\(Int(screen.backingScaleFactor))x 模式=\(mode == .ocr ? "OCR" : "翻译")")
+        Log.info("截图: 遮罩已显示 \(Int(screen.frame.width))×\(Int(screen.frame.height))pt @\(Int(screen.backingScaleFactor))x 模式=\(mode.label)")
         return true
     }
 
@@ -68,27 +81,30 @@ final class ScreenshotController {
             Log.info("截图: 裁剪失败 rect=\(NSStringFromRect(pixelRect))")
             return
         }
-        Log.info("截图: 裁剪 \(cropped.width)×\(cropped.height)px，开始识别")
-
-        PanelController.shared.showScreenshotLoading()
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let outcome = Result { try OCR.recognize(cropped) }
-            DispatchQueue.main.async {
-                switch outcome {
-                case .success(let result):
-                    PanelController.shared.showScreenshotResult(result, mode: mode)
-                case .failure(let error):
-                    PanelController.shared.showScreenshotError(error.localizedDescription)
-                }
-            }
+        // 纯截图：不解码，直接把裁好的图送去缩略图窗
+        if mode == .capture {
+            Log.info("截图: 裁剪 \(cropped.width)×\(cropped.height)px，弹缩略图")
+            CaptureResultController.shared.show(cropped, restoreTo: previousApp)
+            return
         }
+
+        Log.info("截图: 裁剪 \(cropped.width)×\(cropped.height)px，开始识别")
+        PanelController.shared.recognizeScreenshot(cropped, mode: mode)
     }
 
     private func teardown() {
         window?.orderOut(nil)
         window = nil
         isActive = false
+    }
+
+    /// 取消截图时把焦点还给原来的应用（框选时被我们顶掉了）
+    private func restorePreviousApp() {
+        defer { previousApp = nil }
+        guard let app = previousApp,
+              app.bundleIdentifier != Bundle.main.bundleIdentifier,
+              !app.isTerminated else { return }
+        app.activate()
     }
 
     private func screenUnderMouse() -> NSScreen? {

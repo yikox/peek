@@ -366,16 +366,48 @@ final class PanelController: NSObject {
         setState(.loading("识别文字…"))
     }
 
+    /// 对一张已经裁好的图跑 OCR。截图遮罩和缩略图窗的「识别文字」共用这一条路径，
+    /// 免得两处各写一份回调、行为和日志对不上。
+    ///
+    /// `mode` 故意不给默认值：早先默认成 `.ocr`，结果缩略图窗那条调用悄悄变成
+    /// 「只识别不翻译」——识别结果占了结果区，输入框却是空的，看起来像功能坏了。
+    func recognizeScreenshot(_ image: CGImage, mode: ScreenshotMode) {
+        showScreenshotLoading()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = Result { try OCR.recognize(image) }
+            DispatchQueue.main.async {
+                switch outcome {
+                case .success(let result):
+                    self.showScreenshotResult(result, mode: mode)
+                case .failure(let error):
+                    Log.info("截图: OCR 失败 \(error.localizedDescription)")
+                    self.showScreenshotError(error.localizedDescription)
+                }
+            }
+        }
+    }
+
     func showScreenshotResult(_ result: OCR.Result, mode: ScreenshotMode) {
         switch mode {
         case .translate:
-            show(query: result.paragraph, autoTranslate: true)
+            // 识别出来的原文放上面（输入框），译文放下面（结果区），跟 ⌥S 的行为一致
+            let text = result.paragraph.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                Log.info("截图: OCR 无文字（\(result.lines.count) 行 / \(result.elapsed)ms）")
+                showScreenshotError(OCR.OCRError.noText.localizedDescription)
+                return
+            }
+            Log.info("截图: OCR \(result.lines.count) 行 / \(result.elapsed)ms / \(result.variant)，填入输入框并翻译")
+            show(query: text, autoTranslate: true)
         case .ocr:
             show(query: nil, autoTranslate: false)
             var output = TranslateOutput(translation: result.text)
             output.note = "OCR 结果 · \(result.lines.count) 行 · \(result.elapsed)ms · 已复制到剪贴板"
             setState(.result(output))
             writeToPasteboard(result.text)
+        case .capture:
+            // 纯截图不走 OCR 结果展示
+            break
         }
     }
 

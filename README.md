@@ -5,7 +5,7 @@ macOS 浮窗翻译器。纯 AppKit 手写，无第三方依赖、无 Xcode 工�
 交互模型参考了 Bob 0.2.0 的公开界面行为（无边框非激活浮窗 + 贴鼠标出现 + 结果区三态），代码从零实现，没抄一行。
 目标不是做成品，是给一个**可以往里塞自己东西的壳**，而且这个壳在「快 / 丝滑 / 占用少」三项上有可复现的数字。
 
-能力：输入翻译、划词翻译、剪贴板翻译、截图 OCR 翻译、Mac 本地离线翻译、任意 OpenAI 兼容接口。
+能力：输入翻译、划词翻译、剪贴板翻译、截图（复制 / 保存 / 识别）、截图 OCR 翻译、Mac 本地离线翻译、任意 OpenAI 兼容接口。
 
 ![亮色](docs/light.png)
 
@@ -22,9 +22,15 @@ open dist/Peek.app
 ./install.sh            # 或者一步到位：装到 /Applications 并重启
 ```
 
+`build.sh` 会把当前提交和构建时间写进 `Info.plist`（`PeekBuildCommit` / `PeekBuildTime`），启动日志和「设置 → 关于」都能看到，形如 `版本 0.1.0 · cef4663+`。末尾的 `+` 表示编进包里的代码有未提交改动。改完代码不确定装上去的是不是新包时，看这一行比比对时间戳可靠。
+
+**没有自动更新**。这个项目靠源码构建分发，不提供预编译包 —— `git pull && ./install.sh` 就是更新，而且这比自动更新更可控（签名证书不变，辅助功能与屏幕录制的授权也不会掉）。
+
 首次启动会自动弹设置面板。**没有任何配置也能直接开始**：点「还没有 Key？免费注册 →」，向导带你选服务商、打开注册页、粘贴 Key、自动校验额度，完事直接进模型列表挑一个。完全不想联网就切到「离线翻译」（用 macOS 自带模型）或「Mock」。
 
 **热键**
+
+下表是默认值，全部可以在「设置 → 快捷键」里改：点键位框，按下新的组合键即可，`⌫` 清除绑定，`Esc` 取消。组合键至少要带 `⌘`、`⌥`、`⌃` 之一。
 
 | 快捷键   | 行为                 |
 | ----- | ------------------ |
@@ -33,11 +39,16 @@ open dist/Peek.app
 | `⌥V`  | 翻译剪贴板（不需要任何权限）     |
 | `⌥S`  | 截图翻译：拖框 → OCR → 翻译 |
 | `⌥A`  | 截图 OCR：拖框 → 只识别，结果进剪贴板 |
+| `⌥X`  | 截图：拖框 → 缩略图窗，再决定复制 / 保存 / 识别 |
 | `⌥⇧D` | 显示 / 隐藏切换          |
+
+键位存在 `UserDefaults` 的 `hotkeys.v1` 下，改完点「保存」即时生效，不用重启。两个动作不能绑同一个组合键。
 
 `Enter` 翻译，`⇧Enter` 换行，`Esc` 关闭，`⌘Enter` 强制重译。点面板外面自动收起。截图时 `Esc` / 右键 / 点一下不拖（< 4pt）都取消。
 
-**权限**：`⌥D` 要辅助功能，`⌥S` / `⌥A` 要屏幕录制。第一次触发时会弹系统授权框，勾完最好重启一次 App。
+缩略图窗里：`⌘C` 复制、`⌘S` 保存、`⏎` 识别文字，双击缩略图直接复制，点窗口外面或 `Esc` 收起。
+
+**权限**：`⌥D` 要辅助功能，`⌥S` / `⌥A` / `⌥X` 要屏幕录制。第一次触发时会弹系统授权框，勾完最好重启一次 App。
 
 **签名（可选，但强烈建议）**
 
@@ -167,6 +178,11 @@ final class MyEngine: TranslateEngine {
 `⌥S` 拉出全屏遮罩：`CGDisplayCreateImage` **只抓一次**冻结画面，之后拖框不再重复抓屏（这是能跟手的前提）。
 遮罩上挖出选区透明洞、1.5pt 蓝框、左上角 `380 × 200` 尺寸标签，光标旁跟一个 8× 放大镜（靠边自动翻到另一侧）。
 `⌥S` 出译文，`⌥A` 只出识别结果并写剪贴板。
+
+`⌥X` 是纯截图，和上面两条共用同一套遮罩与裁剪，区别只在框完之后：不直接跑 OCR，
+而是弹一个缩略图窗（图 + 尺寸 + 字节数），下面三个按钮——复制到剪贴板、保存成 PNG、识别文字。
+保存走标准存储面板，默认落在桌面；识别则交回主面板，走和 `⌥A` 完全相同的路径。
+这个窗口是 `nonactivatingPanel`，不会激活 App；关掉时把焦点还给框选前那个应用。
 
 识别走 Vision `VNRecognizeTextRequest`：`.accurate` + `usesLanguageCorrection` +
 `recognitionLanguages ["zh-Hans", "en-US"]` + **关闭** `automaticallyDetectsLanguage`（开了会忽略我们指定的顺序，小号中文掉得厉害）。
@@ -316,12 +332,14 @@ Sources/Peek/
 ├── CardView.swift          圆角卡片
 ├── Theme.swift             配色与字体
 ├── Config.swift            尺寸常量与偏好键
-├── HotKey.swift            Carbon 热键
+├── HotKey.swift            Carbon 热键（注册 / 注销）
 ├── SelectionGrabber.swift  划词取词（AX 直读 → 模拟 ⌘C 兜底）
 ├── ScreenCapture.swift     抓屏冻结帧 + 像素裁剪
 ├── ScreenshotOverlay.swift 框选遮罩（挖洞 / 蓝框 / 尺寸标签 / 8× 放大镜）
+├── CaptureResult.swift     截图缩略图窗（复制 / 保存 / 识别）
 ├── OCR.swift               Vision 识别 + 行聚类 + 预处理与两路选优
-├── SettingsWindow.swift    设置面板
+├── HotKeySpec.swift        快捷键动作定义、默认值、持久化与键名格式化
+├── SettingsWindow.swift    设置面板（左侧分类：引擎 / 快捷键 / 通用 / 关于）
 ├── ModelBrowserWindow.swift  模型列表 + 可用性探测（NSTableView）
 ├── SignupWizard.swift      注册向导（三步）
 ├── StatusItemController.swift  菜单栏
@@ -350,6 +368,7 @@ Sources/Peek/
 .build/release/Peek --snapshot /tmp/a.png                 # 渲染成图
 .build/release/Peek --snapshot /tmp/b.png --dark          # 暗色
 .build/release/Peek --snapshot-settings /tmp/s.png        # 渲染设置窗口
+.build/release/Peek --snapshot-settings /tmp/k.png --page 1  # 1 快捷键 / 2 通用 / 3 关于
 .build/release/Peek --snapshot-models /tmp/m.png          # 渲染模型列表
 .build/release/Peek --snapshot-signup /tmp/w.png --step 1 # 渲染注册向导
 .build/release/Peek --verify-catalog                      # 拉一次 OpenRouter 模型目录

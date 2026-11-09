@@ -28,8 +28,14 @@ enum Snapshot {
         render(view, to: path)
     }
 
-    /// 设置窗口的离线渲染
-    static func captureSettings(dark: Bool, path: String) {
+    /// 把「正在显示的面板」原样渲染成 PNG。用于验证真实链路（比如截图识别 + 翻译）
+    /// 跑完之后的界面，而不是拿 sample() 假数据摆拍。
+    static func captureLive(path: String) {
+        render(PanelController.shared.snapshotView(), to: path)
+    }
+
+    /// 设置窗口的离线渲染。page: 0 引擎 / 1 快捷键 / 2 通用 / 3 关于
+    static func captureSettings(dark: Bool, path: String, page: Int = 0) {
         if dark {
             NSApp.appearance = NSAppearance(named: .darkAqua)
         }
@@ -49,7 +55,9 @@ enum Snapshot {
         defaults.set("sk-or-v1-xxxxxxxxxxxxxxxx", forKey: PrefKey.apiKey)
         defaults.set("google/gemma-4-26b-a4b-it:free", forKey: PrefKey.model)
 
+        SettingsWindow.shared.debugSelect(page: page)
         guard let view = SettingsWindow.shared.debugContentView() else { return }
+        SettingsWindow.shared.debugSelect(page: page)
         render(view, to: path, fillBackground: true)
     }
 
@@ -119,6 +127,29 @@ enum Snapshot {
         let size = NSSize(width: 735, height: 478)
         let view = ScreenshotView(frame: NSRect(origin: .zero, size: size), image: image)
         view.debugSetSelection(NSRect(x: 120, y: 180, width: 380, height: 200))
+        render(view, to: path, fillBackground: true)
+    }
+
+    /// 截图缩略图窗的离线渲染：拿一张图当「刚截完的结果」，看排版和按钮。
+    /// 完全走视图离屏绘制，不需要屏幕录制权限。
+    static func captureResult(imagePath: String, dark: Bool, path: String) {
+        if dark {
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
+        guard let image = NSImage(contentsOfFile: imagePath)?
+            .cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            print("读图失败: \(imagePath)")
+            return
+        }
+        let thumb = CaptureResultPanel.thumbSize(for: image)
+        let size = CaptureResultPanel.windowSize(thumb: thumb)
+        let panel = CaptureResultPanel(size: size, thumb: thumb)
+        panel.setImage(image)
+        guard let view = panel.contentView else {
+            print("内容视图缺失")
+            return
+        }
+        view.frame = NSRect(origin: .zero, size: size)
         render(view, to: path, fillBackground: true)
     }
 

@@ -105,7 +105,9 @@ if let base = argument(after: "--open-models") {
 if let path = argument(after: "--snapshot-settings") {
     app.setActivationPolicy(.accessory)
     app.finishLaunching()
-    Snapshot.captureSettings(dark: CommandLine.arguments.contains("--dark"), path: path)
+    Snapshot.captureSettings(dark: CommandLine.arguments.contains("--dark"),
+                             path: path,
+                             page: Int(argument(after: "--page") ?? "0") ?? 0)
     exit(0)
 }
 
@@ -136,6 +138,14 @@ if let src = argument(after: "--snapshot-screenshot"), let out = argument(after:
     app.setActivationPolicy(.accessory)
     app.finishLaunching()
     Snapshot.captureScreenshotOverlay(imagePath: src, path: out)
+    exit(0)
+}
+
+// 截图缩略图窗渲染：--snapshot-capture <图> --out <输出png>
+if let src = argument(after: "--snapshot-capture"), let out = argument(after: "--out") {
+    app.setActivationPolicy(.accessory)
+    app.finishLaunching()
+    Snapshot.captureResult(imagePath: src, dark: CommandLine.arguments.contains("--dark"), path: out)
     exit(0)
 }
 

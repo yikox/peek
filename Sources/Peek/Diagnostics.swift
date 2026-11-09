@@ -42,11 +42,15 @@ enum Log {
         let isTrusted = AXIsProcessTrusted()
         let canRecord = CGPreflightScreenCaptureAccess()
         let onDiskVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        // 构建标识由 build.sh 注入：确认「装上去的」和「刚编的」是不是同一份
+        let buildCommit = Bundle.main.infoDictionary?["PeekBuildCommit"] as? String ?? ""
+        let buildTime = Bundle.main.infoDictionary?["PeekBuildTime"] as? String ?? ""
 
         info("──────── launch ────────")
         info("bundle: \(bundle)")
         info("exe:    \(exe)")
-        info("ver:    \(onDiskVersion)  pid: \(ProcessInfo.processInfo.processIdentifier)")
+        let buildTag = buildCommit.isEmpty ? "" : " (\(buildCommit), \(buildTime))"
+        info("ver:    \(onDiskVersion)\(buildTag)  pid: \(ProcessInfo.processInfo.processIdentifier)")
         info("parent: \(ProcessInfo.processInfo.environment["__CFBundleIdentifier"] ?? "-")")
         info("accessibility(取词): \(isTrusted ? "granted" : "NOT granted")")
         info("screenCapture(截图): \(canRecord ? "granted" : "not granted")")

@@ -86,14 +86,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             PanelController.shared.showScreenshot(.ocr)
         }
 
+        // 纯截图入口（外部触发/自动化验证用）
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.screenshot"),
+            object: nil,
+            queue: .main
+        ) { _ in
+            Log.info("截图: 外部触发起始（纯截图）perm=\(ScreenCapture.hasPermission)")
+            PanelController.shared.showScreenshot(.capture)
+        }
+
         // OCR 自检：对磁盘上的图片跑一遍识别，结果写日志（不需要任何权限）
+        // userInfo: ["path": ..., "mode": "translate"]
+        // mode=translate 走的是缩略图窗「识别文字」那条链路：原文进输入框、译文进结果区
         DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.peek.translator.selftestOCR"),
             object: nil,
             queue: .main
         ) { note in
             let path = (note.userInfo?["path"] as? String) ?? ""
-            Log.info("OCR 自检: 文件 \(path)")
+            let wantsTranslate = (note.userInfo?["mode"] as? String) == "translate"
+            Log.info("OCR 自检: 文件 \(path) 链路=\(wantsTranslate ? "识别+翻译" : "只识别")")
+
+            if wantsTranslate {
+                guard let image = NSImage(contentsOfFile: path)?
+                    .cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                    Log.info("OCR 自检: 图片读不出来 \(path)")
+                    return
+                }
+                PanelController.shared.recognizeScreenshot(image, mode: .translate)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    let query = PanelController.shared.debugQueryText
+                    let result = PanelController.shared.debugResultText
+                    Log.info("面板自检: 输入框 \(query.count) 字「\(query.prefix(40))」 | 结果区 \(result.count) 字「\(result.prefix(60))」")
+                }
+                return
+            }
+
             DispatchQueue.global(qos: .userInitiated).async {
                 let outcome = Result {
                     guard let image = NSImage(contentsOfFile: path)?
@@ -112,6 +141,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
+        }
+
+        // 把当前面板原样导出成 PNG，用于验证真实链路跑完后的界面
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.snapshotPanel"),
+            object: nil,
+            queue: .main
+        ) { note in
+            let path = (note.userInfo?["path"] as? String) ?? "/tmp/peek-panel.png"
+            Snapshot.captureLive(path: path)
+            Log.info("面板快照: \(path)")
         }
 
         // 外部触发授权引导：弹系统的辅助功能授权框
@@ -199,41 +239,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    /// 按当前配置注册全部全局热键。
+    /// 键位不再是硬编码：每一次都从 HotKeyStore 读，用户在设置里改完即时生效。
     private func registerHotKeys() {
-        // Carbon 常量转 UInt32
-        let option = UInt32(optionKey)
-        let optionShift = UInt32(optionKey | shiftKey)
+        var report: [String] = []
+        var occupied: [String] = []
 
-        let okF = HotKeyCenter.shared.register(keyCode: KeyCode.f, carbonModifiers: option) {
-            PanelController.shared.showInput()
+        for action in HotKeyAction.allCases {
+            guard let combo = HotKeyStore.combo(for: action) else {
+                report.append("\(action.title)=未设置")
+                continue
+            }
+            let ok = HotKeyCenter.shared.register(keyCode: combo.keyCode,
+                                                  carbonModifiers: combo.modifiers) {
+                action.perform()
+            }
+            report.append("\(action.title)=\(combo.display)\(ok ? "" : "(FAIL)")")
+            if !ok { occupied.append(combo.display) }
         }
 
-        let okD = HotKeyCenter.shared.register(keyCode: KeyCode.d, carbonModifiers: option) {
-            PanelController.shared.showWithSelection()
+        Log.info("热键: " + report.joined(separator: " "))
+        if !occupied.isEmpty {
+            Log.info("热键被占用：\(occupied.joined(separator: "、")) —— 可能与其他应用冲突（Raycast / 输入法 / 其他翻译工具），去设置里换一个组合键")
         }
+    }
 
-        let okShiftD = HotKeyCenter.shared.register(keyCode: KeyCode.d, carbonModifiers: optionShift) {
-            PanelController.shared.toggleInput()
-        }
-
-        // ⌥V：翻译剪贴板内容。不需要辅助功能权限，是划词取不到时的兜底。
-        let okV = HotKeyCenter.shared.register(keyCode: KeyCode.v, carbonModifiers: option) {
-            PanelController.shared.showFromClipboard()
-        }
-
-        // ⌥S / ⌥A：截图翻译 / 截图 OCR（需要屏幕录制权限）
-        let okS = HotKeyCenter.shared.register(keyCode: KeyCode.s, carbonModifiers: option) {
-            PanelController.shared.showScreenshot(.translate)
-        }
-
-        let okA = HotKeyCenter.shared.register(keyCode: KeyCode.a, carbonModifiers: option) {
-            PanelController.shared.showScreenshot(.ocr)
-        }
-
-        Log.info("热键: ⌥F=\(okF ? "ok" : "FAIL") ⌥D=\(okD ? "ok" : "FAIL") ⌥⇧D=\(okShiftD ? "ok" : "FAIL") ⌥V=\(okV ? "ok" : "FAIL") ⌥S=\(okS ? "ok" : "FAIL") ⌥A=\(okA ? "ok" : "FAIL")")
-        if !okF || !okD {
-            Log.info("热键被占用：可能与其他应用冲突（Raycast / 输入法 / 其他翻译工具）")
-        }
+    /// 设置界面保存后调用：先全摘，再按新配置重来。
+    /// 录制新键位期间也会先摘掉，否则按下的组合会被系统当全局热键吃掉。
+    func reloadHotKeys() {
+        HotKeyCenter.shared.unregisterAll()
+        registerHotKeys()
     }
 
     /// 首次启动且没配过引擎时，直接把设置面板推到面前。

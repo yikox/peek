@@ -22,6 +22,15 @@ if [ -f build/AppIcon.icns ]; then
   cp build/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 fi
 
+# 构建标识：把这次的提交和构建时间写进包，用来确认装上去的到底是哪一版。
+# 上一轮排查「改了代码但行为没变」时，就是靠翻时间戳和字符串才判断出二进制没更新，
+# 有了这两个字段，「关于」页和启动日志一眼就能看出来。
+BUILD_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null || BUILD_COMMIT="${BUILD_COMMIT}+"
+fi
+BUILD_TIME=$(date "+%Y-%m-%d %H:%M")
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -57,6 +66,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+/usr/libexec/PlistBuddy -c "Add :PeekBuildCommit string $BUILD_COMMIT" "$APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :PeekBuildTime string $BUILD_TIME" "$APP/Contents/Info.plist" 2>/dev/null || true
+echo "构建标识: $BUILD_COMMIT ($BUILD_TIME)"
 # 签名：优先用本地自签名身份（tools/signing），退化到 ad-hoc。
 #
 # 为什么要自签名而不是 ad-hoc：

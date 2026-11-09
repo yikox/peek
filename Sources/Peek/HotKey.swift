@@ -42,6 +42,16 @@ final class HotKeyCenter {
         handlers[id]?()
     }
 
+    /// 全部注销。设置界面录制新键位时必须先摘掉，
+    /// 否则按下的组合键会被系统当成全局热键吃掉，录制控件根本收不到 keyDown。
+    func unregisterAll() {
+        for (_, ref) in refs {
+            UnregisterEventHotKey(ref)
+        }
+        refs.removeAll()
+        handlers.removeAll()
+    }
+
     private func installIfNeeded() {
         guard !installed else { return }
         installed = true
@@ -88,6 +98,7 @@ enum KeyCode {
     static let v: UInt32 = UInt32(kVK_ANSI_V)
     static let s: UInt32 = UInt32(kVK_ANSI_S)
     static let a: UInt32 = UInt32(kVK_ANSI_A)
+    static let x: UInt32 = UInt32(kVK_ANSI_X)
     static let escape: UInt32 = UInt32(kVK_Escape)
     static let enter: UInt32 = UInt32(kVK_Return)
     static let keypadEnter: UInt32 = UInt32(kVK_ANSI_KeypadEnter)
