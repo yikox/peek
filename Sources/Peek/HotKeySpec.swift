@@ -11,7 +11,6 @@ enum HotKeyAction: String, CaseIterable {
     case clipboard
     case capture
     case screenshotTranslate
-    case screenshotOCR
 
     var title: String {
         switch self {
@@ -21,7 +20,6 @@ enum HotKeyAction: String, CaseIterable {
         case .clipboard:         return "翻译剪贴板"
         case .capture:           return "截图"
         case .screenshotTranslate: return "截图翻译"
-        case .screenshotOCR:     return "截图 OCR"
         }
     }
 
@@ -34,19 +32,17 @@ enum HotKeyAction: String, CaseIterable {
         case .clipboard:         return "翻译剪贴板内容，不需要任何权限"
         case .capture:           return "框选后弹缩略图，可复制 / 保存 / 识别"
         case .screenshotTranslate: return "框选 → OCR → 翻译，需要屏幕录制权限"
-        case .screenshotOCR:     return "框选 → 只识别，结果写进剪贴板"
         }
     }
 
     var defaultCombo: HotKeyCombo {
         switch self {
-        case .input:               return HotKeyCombo(keyCode: UInt32(kVK_ANSI_F), modifiers: UInt32(optionKey))
+        case .input:               return HotKeyCombo(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(optionKey))
         case .selection:           return HotKeyCombo(keyCode: UInt32(kVK_ANSI_D), modifiers: UInt32(optionKey))
         case .togglePanel:         return HotKeyCombo(keyCode: UInt32(kVK_ANSI_D), modifiers: UInt32(optionKey | shiftKey))
         case .clipboard:           return HotKeyCombo(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(optionKey))
         case .capture:             return HotKeyCombo(keyCode: UInt32(kVK_ANSI_X), modifiers: UInt32(optionKey))
         case .screenshotTranslate: return HotKeyCombo(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(optionKey))
-        case .screenshotOCR:       return HotKeyCombo(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(optionKey))
         }
     }
 
@@ -59,7 +55,6 @@ enum HotKeyAction: String, CaseIterable {
         case .clipboard:           PanelController.shared.showFromClipboard()
         case .capture:             PanelController.shared.showScreenshot(.capture)
         case .screenshotTranslate: PanelController.shared.showScreenshot(.translate)
-        case .screenshotOCR:       PanelController.shared.showScreenshot(.ocr)
         }
     }
 

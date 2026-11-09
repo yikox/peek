@@ -40,7 +40,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         // 动作顺序按使用频率排，快捷键在 menuWillOpen 里按当前配置填
         let order: [HotKeyAction] = [.input, .selection, .capture,
-                                     .screenshotTranslate, .screenshotOCR,
+                                     .screenshotTranslate,
                                      .clipboard, .togglePanel]
         for action in order {
             let menuItem = NSMenuItem(title: action.title,
