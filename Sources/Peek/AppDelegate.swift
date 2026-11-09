@@ -154,6 +154,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.info("面板快照: \(path)")
         }
 
+        // 复制按钮自检：selftestCopy target=query|result。
+        // 走 performClick，能把「按钮有没有连到回调」一起验证掉。
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.selftestCopy"),
+            object: nil,
+            queue: .main
+        ) { note in
+            let target = (note.userInfo?["target"] as? String) ?? "result"
+            let got = PanelController.shared.debugClickCopyBadge(target)
+            Log.info("复制自检[\(target)]: 剪贴板 → \(got.prefix(60))")
+        }
+
         // 外部触发授权引导：弹系统的辅助功能授权框
         DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.peek.translator.requestAccessibility"),

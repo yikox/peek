@@ -23,7 +23,6 @@ final class PanelController: NSObject {
     // 顶部条
     private let topBar = NSView()
     private let engineControl = MenuControl(frame: .zero)
-    private let copyButton = NSButton()
     private let settingsButton = NSButton()
     private let closeButton = NSButton()
 
@@ -39,6 +38,14 @@ final class PanelController: NSObject {
 
     // 结果区
     private let resultView = ResultView(frame: .zero)
+
+    // 复制：各自贴着原文区、译文区的右上角。
+    // 原来只有顶部条一个复制图标，语义上分不清复制的是哪一半。
+    private let queryCopyBadge = CopyBadge(toolTip: "复制原文")
+    private let resultCopyBadge = CopyBadge(toolTip: "复制译文")
+
+    /// 复制按钮占掉的右侧空间。文字区按这个数收窄，按钮才不会压在字上
+    private static let copyGutter: CGFloat = 24
 
     // 状态
     private var engines: [TranslateEngine] = EngineRegistry.makeAll()
@@ -79,6 +86,11 @@ final class PanelController: NSObject {
             SettingsWindow.shared.show()
         }
 
+        resultView.trailingInset = Self.copyGutter
+        resultCopyBadge.onCopy = { [weak self] in self?.copyResult() }
+        resultCopyBadge.isHidden = true
+        resultView.addSubview(resultCopyBadge)
+
         relayout(resultH: currentResultH, keepTopLeft: false)
         setState(.idle)
     }
@@ -100,11 +112,9 @@ final class PanelController: NSObject {
         engineControl.toolTip = "切换翻译引擎（离线翻译 / OpenAI 兼容 / Mock）"
         rebuildEngineMenu()
 
-        configure(icon: copyButton, symbol: "doc.on.doc", action: #selector(copyResult))
         configure(icon: settingsButton, symbol: "gearshape", action: #selector(openSettings))
         configure(icon: closeButton, symbol: "xmark", action: #selector(closePanel))
 
-        topBar.addSubview(copyButton)
         topBar.addSubview(settingsButton)
         topBar.addSubview(closeButton)
     }
@@ -140,6 +150,29 @@ final class PanelController: NSObject {
 
         queryScroll.documentView = queryTextView
         rootCard.addSubview(whiteCard)
+
+        queryCopyBadge.onCopy = { [weak self] in
+            guard let self else { return }
+            let text = self.queryTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return }
+            self.writeToPasteboard(text)
+            Log.info("复制: 原文 \(text.count) 字")
+        }
+        queryCopyBadge.isHidden = true
+        // 必须排在 queryScroll 之后，否则会被滚动视图压在下面点不到
+        whiteCard.addSubview(queryCopyBadge)
+
+        // 手动打字时原文复制按钮也要跟着出现 / 消失，不能只在 show() 时算一次
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(queryTextChanged),
+            name: NSText.didChangeNotification,
+            object: queryTextView
+        )
+    }
+
+    @objc private func queryTextChanged() {
+        updateCopyBadges()
     }
 
     private func buildServiceBar() {
@@ -184,7 +217,6 @@ final class PanelController: NSObject {
         let buttonY: CGFloat = 1
         closeButton.frame = NSRect(x: Metrics.contentW - 22, y: buttonY, width: 22, height: 22)
         settingsButton.frame = NSRect(x: Metrics.contentW - 22 - 6 - 22, y: buttonY, width: 22, height: 22)
-        copyButton.frame = NSRect(x: Metrics.contentW - 22 - 6 - 22 - 6 - 22, y: buttonY, width: 22, height: 22)
 
         let cardH = Metrics.whiteCardH
         whiteCard.frame = NSRect(x: M,
@@ -197,9 +229,14 @@ final class PanelController: NSObject {
                                    width: Metrics.contentW,
                                    height: Metrics.queryH)
 
-        let qw = queryScroll.contentSize.width
+        // 文字提前让开右上角的复制按钮，否则长行会从按钮底下穿过去
+        let qw = max(0, queryScroll.contentSize.width - Self.copyGutter)
         queryTextView.frame = NSRect(x: 0, y: 0, width: qw, height: Metrics.queryH)
         queryTextView.layoutPlaceholder(bounds: NSRect(x: 0, y: 0, width: qw, height: Metrics.queryH))
+
+        queryCopyBadge.frame = NSRect(x: Metrics.contentW - Self.copyGutter,
+                                      y: cardH - Metrics.innerPad - 26,
+                                      width: 20, height: 20)
 
         let barW = Metrics.contentW - M * 2
         serviceBar.frame = NSRect(x: M, y: Metrics.innerPad, width: barW, height: Metrics.serviceBarH)
@@ -209,6 +246,10 @@ final class PanelController: NSObject {
         targetControl.frame = NSRect(x: half + 30, y: 0, width: half, height: Metrics.serviceBarH)
 
         resultView.frame = NSRect(x: M, y: M, width: Metrics.contentW, height: currentResultH)
+        // 相对 resultView 的坐标：贴右上角，中心对齐首行文字
+        resultCopyBadge.frame = NSRect(x: Metrics.contentW - Self.copyGutter,
+                                       y: currentResultH - 26,
+                                       width: 20, height: 20)
     }
 
     private func relayout(resultH: CGFloat, keepTopLeft: Bool) {
@@ -434,6 +475,7 @@ final class PanelController: NSObject {
         } else if !wasVisible {
             queryTextView.setSelectedRange(NSRange(location: (queryTextView.string as NSString).length, length: 0))
         }
+        updateCopyBadges()
 
         positionNearMouse()
 
@@ -604,6 +646,17 @@ final class PanelController: NSObject {
         }
         let height = resultView.render(attributed)
         relayout(resultH: height, keepTopLeft: true)
+        updateCopyBadges()
+    }
+
+    /// 复制按钮各自只在对应区域有内容时出现。
+    /// 空着还摆个复制按钮，点下去什么都不发生，反而像是坏了。
+    private func updateCopyBadges() {
+        queryCopyBadge.isHidden = queryTextView.string.isEmpty
+
+        var hasResult = false
+        if case .result = state { hasResult = true }
+        resultCopyBadge.isHidden = !hasResult
     }
 
     // MARK: - 动作
@@ -631,6 +684,7 @@ final class PanelController: NSObject {
         let text = resultView.plainText().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         writeToPasteboard(text)
+        Log.info("复制: 译文 \(text.count) 字")
     }
 
     private func writeToPasteboard(_ text: String) {
@@ -670,6 +724,17 @@ final class PanelController: NSObject {
     func debugTranslate(text: String) {
         queryTextView.setText(text)
         translate(text: text)
+    }
+
+    /// 自检用：真的走一遍按钮的 target/action，再把剪贴板读回来。
+    /// 只调 copyResult() 是测不出「按钮有没有连对」的。
+    func debugClickCopyBadge(_ which: String) -> String {
+        if which == "query" {
+            queryCopyBadge.performClick(nil)
+        } else {
+            resultCopyBadge.performClick(nil)
+        }
+        return NSPasteboard.general.string(forType: .string) ?? "<剪贴板为空>"
     }
 
     func debugUseMockEngine() {

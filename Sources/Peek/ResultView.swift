@@ -12,6 +12,10 @@ final class ResultView: NSView, NSTextViewDelegate {
     private let textView = NSTextView()
     private var contentHeight: CGFloat = 0
 
+    /// 右侧留给浮动复制按钮的宽度。
+    /// 不收窄的话，长行会从按钮底下穿过去，半透明图标压着字很难读。
+    var trailingInset: CGFloat = 0
+
     /// 点结果区里的「打开设置」时回调
     var onOpenSettings: (() -> Void)?
 
@@ -89,7 +93,7 @@ final class ResultView: NSView, NSTextViewDelegate {
         super.layout()
         scrollView.frame = bounds
         let width = scrollView.contentSize.width
-        let textWidth = max(0, width - textView.textContainerInset.width * 2)
+        let textWidth = max(0, width - textView.textContainerInset.width * 2 - trailingInset)
         if textView.frame.width != textWidth || textView.frame.height != max(contentHeight, bounds.height) {
             textView.frame = NSRect(x: 0,
                                     y: 0,
@@ -103,7 +107,7 @@ final class ResultView: NSView, NSTextViewDelegate {
     /// 渲染并返回该内容所需的窗口内结果区高度。
     @discardableResult
     func render(_ attributed: NSAttributedString) -> CGFloat {
-        let textWidth = max(0, Metrics.contentW - textView.textContainerInset.width * 2)
+        let textWidth = max(0, Metrics.contentW - textView.textContainerInset.width * 2 - trailingInset)
         contentHeight = TextMetrics.height(of: attributed, width: textWidth)
             + textView.textContainerInset.height * 2
             + 2 // 余量，避免滚动条出现时闪一下
