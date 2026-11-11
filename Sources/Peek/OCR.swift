@@ -108,20 +108,33 @@ enum OCR {
         }
     }
 
-    /// 预热：首次调用 Vision 要加载模型，实测冷启动 15 秒、热态 190ms。
+    /// 预热：首次调用 Vision 要加载模型，实测冷启动 15~18 秒、热态 190ms。
     /// 启动后后台跑一次空识别，把模型留在内存里，第一次截图才不用等。
     static func prewarm() {
         DispatchQueue.global(qos: .utility).async {
             guard let context = CGContext(data: nil, width: 8, height: 8,
                                           bitsPerComponent: 8, bytesPerRow: 0,
                                           space: CGColorSpaceCreateDeviceGray(),
-                                          bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
+                                          bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
+                Log.info("OCR: 预热跳过（建不出画布）")
+                return
+            }
             context.setFillColor(gray: 1, alpha: 1)
             context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
-            guard let image = context.makeImage() else { return }
+            guard let image = context.makeImage() else {
+                Log.info("OCR: 预热跳过（画布出不了图）")
+                return
+            }
             let start = Date()
-            _ = try? recognize(image, enhance: .off)
-            Log.info("OCR: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms")
+            do {
+                let result = try recognize(image, enhance: .off)
+                Log.info("OCR: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms，\(result.lines.count) 行")
+            } catch OCR.OCRError.noText {
+                // 空白图认不出字是预期的：模型已经加载完，预热目的达到
+                Log.info("OCR: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms（空图无文字）")
+            } catch {
+                Log.info("OCR: 预热失败 \(error.localizedDescription)")
+            }
         }
     }
 

@@ -236,6 +236,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let next = !PrefKey.clipboardHistoryEnabled
         UserDefaults.standard.set(next, forKey: PrefKey.clipboardHistory)
         clipboardHistoryItem?.state = next ? .on : .off
+        // 关掉记录就把轮询一起停掉：0.4s 一次的 Timer 在「只看不记」时纯属空转
+        if next {
+            ClipboardHistory.shared.start()
+        } else {
+            ClipboardHistory.shared.stop()
+        }
         Log.info("剪贴板历史: 记录\(next ? "开启" : "关闭")")
     }
 

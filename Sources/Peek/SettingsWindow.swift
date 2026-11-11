@@ -272,13 +272,34 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         window?.makeKeyAndOrderFront(nil)
     }
 
+    /// 自检入口：走和「取消」完全一样的路径（恢复热键 → 释放窗口）
+    func debugClose() {
+        cancel()
+    }
+
     private func close() {
         window?.orderOut(nil)
+        releaseWindow()
+    }
+
+    /// 关窗即释放。
+    /// 原来只 orderOut，window 和 4 个页面（含 7 行热键录制控件）就一直挂着到退出。
+    /// 现在下次打开多花几十毫秒重建，换常驻内存干净 —— 设置窗不是高频入口。
+    private func releaseWindow() {
+        window?.contentView = nil
+        window = nil
+        // 页面视图挂在 contentHost 上：只清 pageViews 数组，视图本身还活着。
+        // 得把它们从父视图摘掉，再把容器换新，上一轮的页面才真正释放。
+        contentHost.subviews.forEach { $0.removeFromSuperview() }
+        contentHost = FlippedView()
+        sidebarRows.removeAll()
+        pageViews.removeAll()
     }
 
     func windowWillClose(_ notification: Notification) {
         // 关窗时若还在录制，热键处于摘下状态，必须补回来
         resumeHotKeys()
+        releaseWindow()
     }
 
     /// 供离屏渲染使用

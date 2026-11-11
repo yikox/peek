@@ -48,7 +48,7 @@ final class PanelController: NSObject {
     private static let copyGutter: CGFloat = 24
 
     // 状态
-    private var engines: [TranslateEngine] = EngineRegistry.makeAll()
+    private var engines: [TranslateEngine]
     private var currentEngine: TranslateEngine
     private var state: State = .idle
     private var currentResultH = Metrics.resultMinH
@@ -67,9 +67,11 @@ final class PanelController: NSObject {
                                            height: Metrics.windowH(resultH: Metrics.resultMinH)))
         rootCard = CardView(fill: Theme.panel, bordered: true)
         whiteCard = CardView(fill: Theme.queryBG)
-        currentEngine = EngineRegistry.current(from: EngineRegistry.makeAll())
+        // 引擎列表只建一次：原来属性初始化 + init 里各建一遍，白多一组对象
+        let all = EngineRegistry.makeAll()
+        engines = all
+        currentEngine = EngineRegistry.current(from: all)
         super.init()
-        currentEngine = EngineRegistry.current(from: engines)
         build()
     }
 

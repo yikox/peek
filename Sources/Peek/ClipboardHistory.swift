@@ -30,6 +30,8 @@ final class ClipboardHistory {
     /// 由本 App 写回剪贴板造成的变更，不能当成「用户复制了新东西」
     private var skipChangeCount = -1
     private let fileURL: URL
+    /// 落盘专用（串行，保证写入顺序，且不占用主线程）
+    private let ioQueue = DispatchQueue(label: "com.peek.clipboard.persist", qos: .utility)
 
     /// 单条上限：防止把一个几百兆的日志文件塞进历史
     private static let maxLength = 200_000
@@ -143,10 +145,16 @@ final class ClipboardHistory {
 
     private func persist() {
         guard let data = try? JSONEncoder().encode(items) else { return }
-        try? data.write(to: fileURL, options: [.atomic])
-        // 剪贴板里会有别人贴进来的东西，权限收到只有本人可读
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
-                                               ofItemAtPath: fileURL.path)
+        let target = fileURL
+        // 落盘丢到串行队列：入库发生在主线程（轮询回调 / 点历史条目），
+        // 编码 + 写盘 + 改权限不该堵在 UI 上。串行队列保证写入顺序。
+        ioQueue.async {
+            guard (try? data.write(to: target, options: [.atomic])) != nil else { return }
+            // 剪贴板里会有别人贴进来的东西，权限收到只有本人可读。
+            // .atomic 每次都会换 inode，权限跟着回到默认值，所以必须重设一次。
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                   ofItemAtPath: target.path)
+        }
     }
 
     // MARK: - 展示辅助

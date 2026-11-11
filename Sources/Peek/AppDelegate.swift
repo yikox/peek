@@ -16,18 +16,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 预热：启动时就把窗口与全部子视图建好并 orderOut。
         // 之后每次唤起只做字符串赋值 + orderFront，抹掉"第一次慢一拍"。
-        _ = PanelController.shared
+        // PEEK_LAZY_PANEL=1 时跳过（只用于量「预热到底占多少」，不对外暴露）：
+        // 实测 6 MB，见 README「三个硬指标」。
+        if ProcessInfo.processInfo.environment["PEEK_LAZY_PANEL"] == nil {
+            _ = PanelController.shared
+        }
 
         statusItem = StatusItemController()
 
         registerHotKeys()
         promptInitialSetupIfNeeded()
 
-        // 剪贴板历史：AppKit 没有变更通知，只能轮询 changeCount（0.4s，读一个整数）
-        ClipboardHistory.shared.start()
+        // 剪贴板历史：AppKit 没有变更通知，只能轮询 changeCount（0.4s，读一个整数）。
+        // 记录被关掉时连轮询都不启动 —— 没有计时器就没有唤醒。
+        if PrefKey.clipboardHistoryEnabled {
+            ClipboardHistory.shared.start()
+        } else {
+            Log.info("剪贴板历史: 记录已关闭，不启动轮询")
+        }
 
         // OCR 预热：Vision 冷启动要十几秒，启动后先在后台把模型拉起来。
-        // 代价是模型常驻内存（实测 phys_footprint 18 MB → 83 MB），所以给一个开关。
+        // 代价是模型常驻内存（实测 19 MB → 稳定 53 MB，加载瞬间峰值 84 MB），所以给一个开关。
         if PrefKey.prewarmOCRDefault {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 OCR.prewarm()
@@ -183,6 +192,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             c.debugClickPin()
             let keptWhenFree = c.debugOutsideClick()
             Log.info("图钉自检: 点击翻转=\(clickWorked ? "ok" : "FAIL")；钉住时点外面→\(keptWhenPinned ? "仍显示" : "被收起")；未钉住时点外面→\(keptWhenFree ? "仍显示" : "被收起")")
+        }
+
+        // 外部触发：打开设置窗（自检 / 调试用，用来验证「关窗后有没有真的释放」）
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.openSettings"),
+            object: nil,
+            queue: .main
+        ) { _ in
+            SettingsWindow.shared.show()
+        }
+
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.closeSettings"),
+            object: nil,
+            queue: .main
+        ) { _ in
+            SettingsWindow.shared.debugClose()
         }
 
         // 外部触发：打开剪贴板历史窗（自检 / 调试用，等价于按 ⌥Z）

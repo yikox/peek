@@ -650,11 +650,25 @@ final class ModelBrowserWindow: NSObject, NSTableViewDataSource, NSTableViewDele
         loadTask = nil
         setBusy(false)
         panel?.orderOut(nil)
+        releaseContent()
     }
 
     func windowWillClose(_ notification: Notification) {
         probeTask?.cancel()
         loadTask?.cancel()
+        releaseContent()
+    }
+
+    /// 关窗即卸载内容。
+    /// 模型目录动辄几百条，表格的单元格与行缓存、窗口 backing store 都会一直挂着；
+    /// 拆掉 contentView 并把列表数据清空，下次打开重新拉一遍（本来就带缓存，代价很小）。
+    private func releaseContent() {
+        panel?.contentView = nil
+        panel = nil
+        allModels.removeAll()
+        visibleModels.removeAll()
+        outcomes.removeAll()
+        probing.removeAll()
     }
 
     // MARK: 离线渲染

@@ -11,8 +11,20 @@ enum Log {
         return dir.appendingPathComponent("Peek.log")
     }()
 
+    /// 单个日志文件的上限。剪贴板每收一条就写一行，不封顶的话会一直长。
+    private static let maxBytes = 1_000_000
+
     private static let handle: FileHandle? = {
         let fm = FileManager.default
+        // 超限就把当前文件挪成 Peek.log.1，新文件从空开始。
+        // 保留一份上一轮的内容，排障时够用，总占用封顶 2 MB。
+        if let attrs = try? fm.attributesOfItem(atPath: url.path),
+           let size = attrs[.size] as? Int,
+           size > maxBytes {
+            let rotated = url.appendingPathExtension("1")
+            try? fm.removeItem(at: rotated)
+            try? fm.moveItem(at: url, to: rotated)
+        }
         if !fm.fileExists(atPath: url.path) {
             fm.createFile(atPath: url.path, contents: nil)
         }
