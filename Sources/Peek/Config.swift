@@ -40,12 +40,20 @@ enum PrefKey {
     static let hotkeyEnabled = "hotkeyEnabled"
     /// 启动时预热 OCR（Vision 模型常驻，物理占用 +约 65 MB）
     static let prewarmOCR = "prewarmOCR"
+    /// 记录剪贴板历史（最近 10 条文本，落盘到 Application Support）
+    static let clipboardHistory = "clipboardHistory"
 
     /// 默认 true：没写过这个键时当作开启。UserDefaults.bool 默认是 false，不能直接用。
     static var prewarmOCRDefault: Bool {
         UserDefaults.standard.object(forKey: prewarmOCR) == nil
             ? true
             : UserDefaults.standard.bool(forKey: prewarmOCR)
+    }
+
+    static var clipboardHistoryEnabled: Bool {
+        UserDefaults.standard.object(forKey: clipboardHistory) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: clipboardHistory)
     }
 }
 

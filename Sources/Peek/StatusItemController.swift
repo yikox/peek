@@ -6,6 +6,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var launchAtLoginItem: NSMenuItem?
     private var prewarmOCRItem: NSMenuItem?
+    private var clipboardHistoryItem: NSMenuItem?
     /// 动作菜单项与其对应动作，菜单每次打开时按当前配置刷新快捷键
     private var actionItems: [(HotKeyAction, NSMenuItem)] = []
 
@@ -31,7 +32,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             button.title = "译"
             Log.info("状态栏图标: SF Symbol 缺失，退化为文字")
         }
-        button.toolTip = "Peek — ⌥F 输入翻译 / ⌥D 划词翻译"
+        button.toolTip = "Peek — ⌥A 输入翻译 / ⌥D 划词翻译 / ⌥Z 剪贴板历史"
     }
 
     private func buildMenu() -> NSMenu {
@@ -41,7 +42,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // 动作顺序按使用频率排，快捷键在 menuWillOpen 里按当前配置填
         let order: [HotKeyAction] = [.input, .selection, .capture,
                                      .screenshotTranslate,
-                                     .clipboard, .togglePanel]
+                                     .clipboard, .clipboardHistory, .togglePanel]
         for action in order {
             let menuItem = NSMenuItem(title: action.title,
                                       action: #selector(runAction(_:)),
@@ -66,6 +67,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         prewarmItem.state = PrefKey.prewarmOCRDefault ? .on : .off
         prewarmOCRItem = prewarmItem
         menu.addItem(prewarmItem)
+        let historyItem = makeItem("记录剪贴板历史（最近 10 条文本）",
+                                   action: #selector(toggleClipboardHistory), key: "", modifiers: [])
+        historyItem.state = PrefKey.clipboardHistoryEnabled ? .on : .off
+        clipboardHistoryItem = historyItem
+        menu.addItem(historyItem)
+        menu.addItem(makeItem("清空剪贴板历史", action: #selector(clearClipboardHistory), key: "", modifiers: []))
         menu.addItem(.separator())
         menu.addItem(makeItem("退出 Peek", action: #selector(quit), key: "q", modifiers: [.command]))
         return menu
@@ -100,6 +107,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         launchAtLoginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
         prewarmOCRItem?.state = PrefKey.prewarmOCRDefault ? .on : .off
+        clipboardHistoryItem?.state = PrefKey.clipboardHistoryEnabled ? .on : .off
     }
 
     // MARK: - 动作
@@ -220,6 +228,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if alert.runModal() == .alertFirstButtonReturn {
             restart()
         }
+    }
+
+    /// 关掉之后停止记录，但已有条目保留 —— 用户可能只是想暂停一会儿，
+    /// 真要清干净有隔壁的「清空剪贴板历史」。
+    @objc private func toggleClipboardHistory() {
+        let next = !PrefKey.clipboardHistoryEnabled
+        UserDefaults.standard.set(next, forKey: PrefKey.clipboardHistory)
+        clipboardHistoryItem?.state = next ? .on : .off
+        Log.info("剪贴板历史: 记录\(next ? "开启" : "关闭")")
+    }
+
+    @objc private func clearClipboardHistory() {
+        ClipboardHistory.shared.clear()
     }
 
     @objc private func quit() {

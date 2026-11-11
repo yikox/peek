@@ -5,7 +5,7 @@ macOS 浮窗翻译器。纯 AppKit 手写，无第三方依赖、无 Xcode 工�
 交互模型参考了 Bob 0.2.0 的公开界面行为（无边框非激活浮窗 + 贴鼠标出现 + 结果区三态），代码从零实现，没抄一行。
 目标不是做成品，是给一个**可以往里塞自己东西的壳**，而且这个壳在「快 / 丝滑 / 占用少」三项上有可复现的数字。
 
-能力：输入翻译、划词翻译、剪贴板翻译、截图（复制 / 保存 / 识别）、截图翻译、原文与译文各自一键复制、Mac 本地离线翻译、任意 OpenAI 兼容接口。
+能力：输入翻译、划词翻译、剪贴板翻译、截图（复制 / 保存 / 识别）、截图翻译、原文与译文各自一键复制、最近 10 条剪贴板历史、Mac 本地离线翻译、任意 OpenAI 兼容接口。
 
 ![亮色](docs/light.png)
 
@@ -22,7 +22,7 @@ open dist/Peek.app
 ./install.sh            # 或者一步到位：装到 /Applications 并重启
 ```
 
-`build.sh` 会把当前提交和构建时间写进 `Info.plist`（`PeekBuildCommit` / `PeekBuildTime`），启动日志和「设置 → 关于」都能看到，形如 `版本 0.1.0 · cef4663+`。末尾的 `+` 表示编进包里的代码有未提交改动。改完代码不确定装上去的是不是新包时，看这一行比比对时间戳可靠。
+`build.sh` 会把当前提交和构建时间写进 `Info.plist`（`PeekBuildCommit` / `PeekBuildTime`），启动日志和「设置 → 关于」都能看到，形如 `版本 0.1.2 · cef4663+`。末尾的 `+` 表示编进包里的代码有未提交改动。改完代码不确定装上去的是不是新包时，看这一行比比对时间戳可靠。
 
 **没有自动更新**。这个项目靠源码构建分发，不提供预编译包 —— `git pull && ./install.sh` 就是更新，而且这比自动更新更可控（签名证书不变，辅助功能与屏幕录制的授权也不会掉）。
 
@@ -37,6 +37,7 @@ open dist/Peek.app
 | `⌥A`  | 打开输入框（保留上次内容）      |
 | `⌥D`  | 划词翻译：取当前选中文本，直接出结果 |
 | `⌥V`  | 翻译剪贴板（不需要任何权限）     |
+| `⌥Z`  | 剪贴板历史：最近 10 条，点一条放回剪贴板 |
 | `⌥S`  | 截图翻译：拖框 → OCR → 翻译 |
 | `⌥X`  | 截图：拖框 → 缩略图窗，再决定复制 / 保存 / 识别 |
 | `⌥⇧D` | 显示 / 隐藏切换          |
@@ -50,6 +51,14 @@ open dist/Peek.app
 截图时 `Esc` / 右键 / 点一下不拖（< 4pt）都取消。
 
 缩略图窗里：`⌘C` 复制、`⌘S` 保存、`⏎` 识别文字，双击缩略图直接复制，点窗口外面或 `Esc` 收起。
+
+**剪贴板历史**（`⌥Z`）：列出最近 10 条复制过的文本，最新在上。点一条即写回剪贴板并关窗，接着 `⌘V` 就能粘；`↑↓` 选、`⏎` 复制、`1`–`9` 直选、`Esc` 关，点窗口外面也收起。
+
+- 只收**纯文本**，图片和文件不记录 —— 落盘体积不可控，而「复制一段话」才是高频场景
+- 带 `org.nspasteboard.ConcealedType` 标记的跳过，那是密码管理器在声明「别记我」
+- 存在 `~/Library/Application Support/Peek/clipboard-history.json`，文件权限 `0600`
+- 菜单栏可以关掉记录（已有条目保留），也可以一键清空
+- AppKit 没有剪贴板变更通知，靠轮询 `NSPasteboard.changeCount`（0.4s）：没变化时只读一个整数，变了才取内容
 
 **权限**：`⌥D` 要辅助功能，`⌥S` / `⌥A` / `⌥X` 要屏幕录制。第一次触发时会弹系统授权框，勾完最好重启一次 App。
 
@@ -311,6 +320,7 @@ HTTP 链路用本地假服务跑通过端到端（`tools/mock_openai_server.py`�
 
 - 多窗口（同一时间只有一个浮窗；面板可以钉住不收起，但不能再开第二个）
 - 插件系统（JS 脚本宿主）
+- 剪贴板历史只收文本，图片和文件还没做（要做的话得考虑缩略图与体积上限）
 - OCR 的版面分析（现在按行 + 纵向重叠归并，表格、多栏会串行）
 
 **一个已知取舍**：`⌥D` 取词先走 AX 直读（`kAXSelectedText`），不碰剪贴板；
@@ -339,6 +349,8 @@ Sources/Peek/
 ├── ScreenCapture.swift     抓屏冻结帧 + 像素裁剪
 ├── ScreenshotOverlay.swift 框选遮罩（挖洞 / 蓝框 / 尺寸标签 / 8× 放大镜）
 ├── CaptureResult.swift     截图缩略图窗（复制 / 保存 / 识别）
+├── ClipboardHistory.swift  剪贴板历史（轮询 changeCount、只收文本、落盘 0600）
+├── ClipboardHistoryWindow.swift  ⌥Z 历史小窗（键盘导航 + 点击写回）
 ├── OCR.swift               Vision 识别 + 行聚类 + 预处理与两路选优
 ├── HotKeySpec.swift        快捷键动作定义、默认值、持久化与键名格式化
 ├── SettingsWindow.swift    设置面板（左侧分类：引擎 / 快捷键 / 通用 / 关于）
@@ -371,6 +383,7 @@ Sources/Peek/
 .build/release/Peek --snapshot /tmp/b.png --dark          # 暗色
 .build/release/Peek --snapshot-settings /tmp/s.png        # 渲染设置窗口
 .build/release/Peek --snapshot-settings /tmp/k.png --page 1  # 1 快捷键 / 2 通用 / 3 关于
+.build/release/Peek --snapshot-history /tmp/h.png         # 渲染剪贴板历史小窗
 .build/release/Peek --snapshot-models /tmp/m.png          # 渲染模型列表
 .build/release/Peek --snapshot-signup /tmp/w.png --step 1 # 渲染注册向导
 .build/release/Peek --verify-catalog                      # 拉一次 OpenRouter 模型目录

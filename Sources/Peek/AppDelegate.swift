@@ -23,6 +23,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotKeys()
         promptInitialSetupIfNeeded()
 
+        // 剪贴板历史：AppKit 没有变更通知，只能轮询 changeCount（0.4s，读一个整数）
+        ClipboardHistory.shared.start()
+
         // OCR 预热：Vision 冷启动要十几秒，启动后先在后台把模型拉起来。
         // 代价是模型常驻内存（实测 phys_footprint 18 MB → 83 MB），所以给一个开关。
         if PrefKey.prewarmOCRDefault {
@@ -180,6 +183,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             c.debugClickPin()
             let keptWhenFree = c.debugOutsideClick()
             Log.info("图钉自检: 点击翻转=\(clickWorked ? "ok" : "FAIL")；钉住时点外面→\(keptWhenPinned ? "仍显示" : "被收起")；未钉住时点外面→\(keptWhenFree ? "仍显示" : "被收起")")
+        }
+
+        // 外部触发：打开剪贴板历史窗（自检 / 调试用，等价于按 ⌥Z）
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.showClipboardHistory"),
+            object: nil,
+            queue: .main
+        ) { _ in
+            ClipboardHistoryWindow.shared.toggle()
+        }
+
+        // 把当前历史窗导出成 PNG（真实数据，不是样板）
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.snapshotHistoryLive"),
+            object: nil,
+            queue: .main
+        ) { note in
+            let path = (note.userInfo?["path"] as? String) ?? "/tmp/peek-history.png"
+            ClipboardHistoryWindow.shared.debugSnapshot(to: path)
+        }
+
+        // 自检：按索引选中一条，验证「写回剪贴板」这条链路
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.selftestHistoryPick"),
+            object: nil,
+            queue: .main
+        ) { note in
+            let index = Int((note.userInfo?["index"] as? String) ?? "0") ?? 0
+            let before = ClipboardHistory.shared.items.count
+            ClipboardHistoryWindow.shared.debugPick(index: index)
+            let text = NSPasteboard.general.string(forType: .string) ?? "<空>"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                let after = ClipboardHistory.shared.items.count
+                Log.info("历史选中自检: 剪贴板 → \(ClipboardHistory.preview(text)) | 条数 \(before) → \(after)\(before == after ? "（没有重复入库，ok）" : "（FAIL：自己写回的内容又被记了一遍）")")
+            }
+        }
+
+        // 剪贴板历史自检：模拟一次外部复制 → 等一个轮询周期 → 读回。
+        // 覆盖的是「轮询有没有抓到 + 写回有没有生效」这条完整链路。
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.peek.translator.selftestHistory"),
+            object: nil,
+            queue: .main
+        ) { _ in
+            let token = "Peek 剪贴板历史自检 \(Int(Date().timeIntervalSince1970))"
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(token, forType: .string)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                let history = ClipboardHistory.shared
+                let caught = history.items.first?.text == token
+                let total = history.items.count
+                if caught {
+                    history.copyToPasteboard(history.items[0])
+                }
+                let back = NSPasteboard.general.string(forType: .string) ?? "<空>"
+                Log.info("剪贴板历史自检: 捕获=\(caught ? "ok" : "FAIL") 条数=\(total) 写回=\(back == token ? "ok" : "FAIL(\(back.prefix(24)))")")
+                // 这条是测试注入的，别留在真实历史里
+                history.debugRemove(item: token)
+            }
         }
 
         // 外部触发授权引导：弹系统的辅助功能授权框

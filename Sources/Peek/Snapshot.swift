@@ -164,6 +164,39 @@ enum Snapshot {
         }
     }
 
+    /// 剪贴板历史小窗的离线渲染。用假数据，不碰真实剪贴板。
+    static func captureHistory(dark: Bool, path: String) {
+        if dark {
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
+
+        let now = Date()
+        let texts: [String] = [
+            "https://github.com/yikox/peek",
+            "swift build -c release --disable-sandbox",
+            "剪贴板历史要支持键盘导航：↑↓ 选、⏎ 复制、1-9 直选",
+            "The quick brown fox jumps over the lazy dog. It predicts your next edit.",
+            "git log --oneline -5 --decorate",
+            "screencapture -x -t png /tmp/shot.png",
+            "这段文字稍微长一点，用来验证单行截断之后不会把右侧的时间挤掉，也不会在末尾糊成一团。",
+            "make -j8",
+            "NSPasteboard.changeCount 是不会回退的整数，只能在轮询里比大小",
+            "curl -s https://api.github.com/repos/yikox/peek/releases/latest",
+        ]
+        let items = texts.enumerated().map { index, text in
+            ClipboardHistory.Item(text: text, at: now.addingTimeInterval(Double(-index) * 317))
+        }
+
+        let size = ClipboardListView.windowSize(count: items.count)
+        let view = ClipboardListView(items: items, frame: NSRect(origin: .zero, size: size))
+        render(view, to: path, fillBackground: true)
+    }
+
+    /// 把任意视图渲染成 PNG（不做样式注入，原样导出）
+    static func captureView(_ view: NSView, to path: String) {
+        render(view, to: path, fillBackground: true)
+    }
+
     private static func render(_ view: NSView, to path: String, fillBackground: Bool = false) {
         // 离屏渲染不经过窗口，外观不会自动继承 NSApp，得显式挂上
         if let appearance = NSApp.appearance {

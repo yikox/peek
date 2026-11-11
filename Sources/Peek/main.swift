@@ -149,6 +149,14 @@ if let src = argument(after: "--snapshot-capture"), let out = argument(after: "-
     exit(0)
 }
 
+// 剪贴板历史小窗渲染：--snapshot-history <输出png> [--dark]
+if let path = argument(after: "--snapshot-history") {
+    app.setActivationPolicy(.accessory)
+    app.finishLaunching()
+    Snapshot.captureHistory(dark: CommandLine.arguments.contains("--dark"), path: path)
+    exit(0)
+}
+
 // 注册向导渲染：--snapshot-signup <路径> [--step 0|1|2]
 if let path = argument(after: "--snapshot-signup") {
     app.setActivationPolicy(.accessory)

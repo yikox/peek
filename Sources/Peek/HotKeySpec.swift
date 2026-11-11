@@ -9,6 +9,7 @@ enum HotKeyAction: String, CaseIterable {
     case selection
     case togglePanel
     case clipboard
+    case clipboardHistory
     case capture
     case screenshotTranslate
 
@@ -18,6 +19,7 @@ enum HotKeyAction: String, CaseIterable {
         case .selection:         return "划词翻译"
         case .togglePanel:       return "显示 / 隐藏面板"
         case .clipboard:         return "翻译剪贴板"
+        case .clipboardHistory:  return "剪贴板历史"
         case .capture:           return "截图"
         case .screenshotTranslate: return "截图翻译"
         }
@@ -30,6 +32,7 @@ enum HotKeyAction: String, CaseIterable {
         case .selection:         return "读取当前选中的文字，需要辅助功能权限"
         case .togglePanel:       return "面板开着就收起，关着就弹出"
         case .clipboard:         return "翻译剪贴板内容，不需要任何权限"
+        case .clipboardHistory:  return "列出最近 10 条复制内容，点一条放回剪贴板"
         case .capture:           return "框选后弹缩略图，可复制 / 保存 / 识别"
         case .screenshotTranslate: return "框选 → OCR → 翻译，需要屏幕录制权限"
         }
@@ -41,6 +44,7 @@ enum HotKeyAction: String, CaseIterable {
         case .selection:           return HotKeyCombo(keyCode: UInt32(kVK_ANSI_D), modifiers: UInt32(optionKey))
         case .togglePanel:         return HotKeyCombo(keyCode: UInt32(kVK_ANSI_D), modifiers: UInt32(optionKey | shiftKey))
         case .clipboard:           return HotKeyCombo(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(optionKey))
+        case .clipboardHistory:    return HotKeyCombo(keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(optionKey))
         case .capture:             return HotKeyCombo(keyCode: UInt32(kVK_ANSI_X), modifiers: UInt32(optionKey))
         case .screenshotTranslate: return HotKeyCombo(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(optionKey))
         }
@@ -53,6 +57,7 @@ enum HotKeyAction: String, CaseIterable {
         case .selection:           PanelController.shared.showWithSelection()
         case .togglePanel:         PanelController.shared.toggleInput()
         case .clipboard:           PanelController.shared.showFromClipboard()
+        case .clipboardHistory:    ClipboardHistoryWindow.shared.toggle()
         case .capture:             PanelController.shared.showScreenshot(.capture)
         case .screenshotTranslate: PanelController.shared.showScreenshot(.translate)
         }

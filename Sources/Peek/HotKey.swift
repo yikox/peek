@@ -102,6 +102,8 @@ enum KeyCode {
     static let escape: UInt32 = UInt32(kVK_Escape)
     static let enter: UInt32 = UInt32(kVK_Return)
     static let keypadEnter: UInt32 = UInt32(kVK_ANSI_KeypadEnter)
+    static let upArrow: UInt32 = UInt32(kVK_UpArrow)
+    static let downArrow: UInt32 = UInt32(kVK_DownArrow)
     /// 注意：这两个是**虚拟键码**（CGKeyCode），不是修饰键掩码。
     /// 之前误写成 optionKey / cmdKey（0x0800 / 0x1000，修饰键掩码），
     /// 传给 CGEventSource.keyState 永远返回 false —— 于是"等 ⌥ 抬起"形同虚设，
