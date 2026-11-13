@@ -38,7 +38,7 @@ enum PrefKey {
     static let systemPrompt = "openai.systemPrompt"
     static let autoCopy = "autoCopy"
     static let hotkeyEnabled = "hotkeyEnabled"
-    /// 启动时预热 OCR（Vision 模型常驻，物理占用 +约 65 MB）
+    /// 启动时预热 OCR（Vision 模型常驻，物理占用 +约 20~35 MB）
     static let prewarmOCR = "prewarmOCR"
     /// 记录剪贴板历史（最近 10 条文本，落盘到 Application Support）
     static let clipboardHistory = "clipboardHistory"

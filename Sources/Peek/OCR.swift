@@ -47,10 +47,61 @@ enum OCR {
         case force
     }
 
+    /// 所有识别串行化。
+    /// Vision 在模型冷加载（新进程首次，实测 15~48 秒）之后并发调用会互相拖垮，
+    /// 底层的 `e5rt_execution_stream_operation_create...` 直接失败，外层报
+    /// `CRImageReaderError error 1`。串行还顺带保证「预热没跑完，识别不会挤进去」。
+    private static let queue = DispatchQueue(label: "com.peek.ocr", qos: .userInitiated)
+
+    /// 把任意 CGImage 规范成统一位图格式：8-bit / 32bpp / BGRA 预乘 / DeviceRGB。
+    ///
+    /// 这是 `CRImageReaderError 1` 的真正病根（macOS 26/27 实测）：
+    /// 进程首次冷加载模型后，Vision 只认「和第一次调用完全相同的像素格式」。
+    /// 之后只要输入换一种格式（截图的 noneSkipFirst、增强图的灰度 8bpp、
+    /// PNG 解码出来的 16bpc premultipliedLast…），建流就失败，整个进程的识别
+    /// 全废直到重启。把所有输入先压成同一种格式，这条路径就只剩一种 shape。
+    static func normalize(_ image: CGImage) -> CGImage {
+        if image.bitsPerComponent == 8, image.bitsPerPixel == 32,
+           image.alphaInfo == .premultipliedFirst,
+           image.colorSpace?.model == .rgb {
+            return image
+        }
+        let width = image.width, height = image.height
+        guard width > 0, height > 0,
+              let context = CGContext(data: nil, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: width * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                          | CGBitmapInfo.byteOrder32Little.rawValue) else {
+            return image
+        }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage() ?? image
+    }
+
     /// 同步识别。调用方负责放到后台队列（大图耗时几十到几百毫秒）。
     static func recognize(_ image: CGImage,
                          languages: [String] = ["zh-Hans", "en-US"],
                          enhance: Enhance = .auto) throws -> Result {
+        try queue.sync {
+            do {
+                return try recognizeOnce(image, languages: languages, enhance: enhance)
+            } catch OCRError.noText {
+                // 图里就是没字，这是正常结果，不该重试
+                throw OCRError.noText
+            } catch {
+                // 冷加载刚结束时偶发失败很常见：等一拍重试一次，多半能救回来
+                Log.info("OCR: 首次失败（\(error.localizedDescription)），350ms 后重试")
+                Thread.sleep(forTimeInterval: 0.35)
+                return try recognizeOnce(image, languages: languages, enhance: enhance)
+            }
+        }
+    }
+
+    private static func recognizeOnce(_ image: CGImage,
+                                      languages: [String],
+                                      enhance: Enhance) throws -> Result {
         let start = Date()
         let plainVariant = "原图"
         let boostedVariant = "增强"
@@ -108,34 +159,52 @@ enum OCR {
         }
     }
 
-    /// 预热：首次调用 Vision 要加载模型，实测冷启动 15~18 秒、热态 190ms。
-    /// 启动后后台跑一次空识别，把模型留在内存里，第一次截图才不用等。
+    /// 预热：首次调用 Vision 要加载模型，实测冷启动 15~48 秒、热态 100~200ms。
+    /// 启动后后台跑一次真识别，把模型留在内存里，第一次截图才不用等。
+    ///
+    /// **预热图必须是一张正常尺寸、真有文字的图**，不能用 8×8 空白图。
+    /// 实测（macOS 27）：冷启动时若第一条流喂的是极小尺寸，
+    /// 之后真实尺寸的流就再也建不起来 —— 进程内所有识别持续报
+    /// `CRImageReaderError 1`（底层 `e5rt_execution_stream...`），直到重启。
+    /// 换成 900×220 的合成文字图后，冷启动那次 1.1 秒、之后每次 60~110ms 全部正常。
     static func prewarm() {
         DispatchQueue.global(qos: .utility).async {
-            guard let context = CGContext(data: nil, width: 8, height: 8,
-                                          bitsPerComponent: 8, bytesPerRow: 0,
-                                          space: CGColorSpaceCreateDeviceGray(),
-                                          bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
-                Log.info("OCR: 预热跳过（建不出画布）")
-                return
-            }
-            context.setFillColor(gray: 1, alpha: 1)
-            context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
-            guard let image = context.makeImage() else {
-                Log.info("OCR: 预热跳过（画布出不了图）")
+            guard let image = warmupImage() else {
+                Log.info("OCR: 预热跳过（合成不出预热图）")
                 return
             }
             let start = Date()
             do {
                 let result = try recognize(image, enhance: .off)
-                Log.info("OCR: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms，\(result.lines.count) 行")
-            } catch OCR.OCRError.noText {
-                // 空白图认不出字是预期的：模型已经加载完，预热目的达到
-                Log.info("OCR: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms（空图无文字）")
+                Log.info("OCR: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms，\(result.lines.count) 行「\(result.text.prefix(20))」")
             } catch {
                 Log.info("OCR: 预热失败 \(error.localizedDescription)")
             }
         }
+    }
+
+    /// 预热用的合成图：白底黑字，900×220。
+    /// 走 CoreText 而不是 NSImage.lockFocus —— 后者要求主线程，预热跑在后台队列。
+    private static func warmupImage() -> CGImage? {
+        let width = 900, height = 220
+        // 格式必须和 normalize() 的目标格式一致，否则预热那一枪和后续识别的 shape 不同
+        guard let context = CGContext(data: nil, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                          | CGBitmapInfo.byteOrder32Little.rawValue) else {
+            return nil
+        }
+        context.setFillColor(NSColor.white.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(NSColor.black.cgColor)
+        let font = CTFontCreateWithName("Helvetica" as CFString, 56, nil)
+        let line = CTLineCreateWithAttributedString(
+            NSAttributedString(string: "Peek warmup 预热 文字识别",
+                               attributes: [.font: font, .foregroundColor: NSColor.black]))
+        context.textPosition = CGPoint(x: 30, y: 90)
+        CTLineDraw(line, context)
+        return context.makeImage()
     }
 
     // MARK: - 预处理
@@ -233,6 +302,9 @@ enum OCR {
                     languages: [String] = ["zh-Hans", "en-US"],
                     origin: Date = Date(),
                     variant: String) throws -> Result {
+        // 统一像素格式：Vision 冷加载后只认「和首次调用同格式」的输入，格式一变就建流失败
+        let image = normalize(image)
+
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
