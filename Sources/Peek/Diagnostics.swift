@@ -14,7 +14,10 @@ enum Log {
     /// 单个日志文件的上限。剪贴板每收一条就写一行，不封顶的话会一直长。
     private static let maxBytes = 1_000_000
 
-    private static let handle: FileHandle? = {
+    /// 用 O_APPEND 打开的文件描述符，而不是 FileHandle + seekToEndFile。
+    /// 主进程和独立 OCR 进程会同时写这个文件，seek 到尾部再写不是原子操作，
+    /// 两边抢着写就会出现半行乱码（实测出现过）。O_APPEND 让每次 write 原子落尾。
+    private static let handle: Int32 = {
         let fm = FileManager.default
         // 超限就把当前文件挪成 Peek.log.1，新文件从空开始。
         // 保留一份上一轮的内容，排障时够用，总占用封顶 2 MB。
@@ -25,12 +28,7 @@ enum Log {
             try? fm.removeItem(at: rotated)
             try? fm.moveItem(at: url, to: rotated)
         }
-        if !fm.fileExists(atPath: url.path) {
-            fm.createFile(atPath: url.path, contents: nil)
-        }
-        let h = try? FileHandle(forWritingTo: url)
-        h?.seekToEndOfFile()
-        return h
+        return open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
     }()
 
     private static let formatter: DateFormatter = {
@@ -42,8 +40,10 @@ enum Log {
     static func info(_ message: String) {
         let line = "[\(formatter.string(from: Date()))] \(message)\n"
         NSLog("[Peek] %@", message)
-        if let data = line.data(using: .utf8) {
-            handle?.write(data)
+        guard handle >= 0, let data = line.data(using: .utf8) else { return }
+        data.withUnsafeBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            _ = Darwin.write(handle, base, buffer.count)
         }
     }
 

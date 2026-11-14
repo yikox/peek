@@ -79,6 +79,73 @@ extension Verify {
         for line in result.lines { print("    | \(line)") }
     }
 
+    /// Peek --ocr-server：常驻识别进程，按行收发 JSON。
+    ///
+    /// 由 `OCRBridge` 从 GUI 主进程里拉起来。为什么不在主进程里直接识别：
+    /// macOS 27 + 16 GB 机器上，GUI 进程在 Vision 模型冷加载之后会让视觉计算路径
+    /// 进入不可恢复的坏状态（三个设备全报 `CRImageReaderError 1`），
+    /// 而命令行进程同样的冷加载却能正常工作。独立进程还有个好处 —— 坏了能杀掉重来。
+    static func runOCRServer() -> Never {
+        Log.info("OCR 独立进程: 启动 pid=\(getpid())")
+        if let warm = OCR.warmupImage() {
+            let start = Date()
+            do {
+                let result = try OCR.recognize(warm, enhance: .off)
+                Log.info("OCR 独立进程: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms，\(result.lines.count) 行")
+            } catch {
+                Log.info("OCR 独立进程: 预热失败 \(error.localizedDescription)")
+            }
+        }
+
+        // 必须用 POSIX read：FileHandle.read(upToCount:) 会一直阻塞到读满 64 KB 或 EOF，
+        // 常驻模式下对端不会关管道，就永远等不到第一行。
+        var chunk = [UInt8](repeating: 0, count: 65536)
+        var pending = Data()
+        while true {
+            let got = Darwin.read(STDIN_FILENO, &chunk, chunk.count)
+            if got < 0 {
+                if errno == EINTR { continue }
+                Log.info("OCR 独立进程: 读 stdin 失败 errno=\(errno)")
+                break
+            }
+            if got == 0 { break }          // 父进程关闭了管道
+            pending.append(contentsOf: chunk[0..<got])
+            while let index = pending.firstIndex(of: 0x0A) {
+                let line = Data(pending[pending.startIndex..<index])
+                pending = Data(pending[(index + 1)...])
+                reply(with: line)
+            }
+        }
+        exit(0)
+    }
+
+    private static func reply(with line: Data) {
+        var out: [String: Any]
+        do {
+            guard let obj = try JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let path = obj["path"] as? String,
+                  let image = NSImage(contentsOfFile: path)?
+                    .cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                throw OCR.OCRError.imageUnreadable
+            }
+            let name = obj["enhance"] as? String ?? "auto"
+            let enhance: OCR.Enhance = name == "off" ? .off : (name == "force" ? .force : .auto)
+            let result = try OCR.recognize(image, enhance: enhance)
+            out = ["ok": true,
+                   "lines": result.lines,
+                   "paragraph": result.paragraph,
+                   "confidence": Double(result.confidence),
+                   "elapsed": result.elapsed,
+                   "variant": result.variant]
+        } catch {
+            out = ["ok": false, "error": error.localizedDescription]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: out),
+              let text = String(data: data, encoding: .utf8) else { return }
+        print(text)
+        fflush(stdout)
+    }
+
     /// Peek --verify-capture
     static func runCaptureCheck() -> Never {
         print("截图自检")

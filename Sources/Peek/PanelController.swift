@@ -420,7 +420,7 @@ final class PanelController: NSObject {
     func recognizeScreenshot(_ image: CGImage, mode: ScreenshotMode) {
         showScreenshotLoading()
         DispatchQueue.global(qos: .userInitiated).async {
-            let outcome = Result { try OCR.recognize(image) }
+            let outcome = Result { try OCR.recognizeRobust(image) }
             DispatchQueue.main.async {
                 switch outcome {
                 case .success(let result):

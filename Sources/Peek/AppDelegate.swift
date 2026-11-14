@@ -37,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // OCR 预热：Vision 冷启动要十几秒，启动后先在后台把模型拉起来。
         // 代价是模型常驻内存（实测 19 MB → 稳定 53 MB，加载瞬间峰值 84 MB），所以给一个开关。
+        Log.info("OCR: 计算设备 \(OCR.debugDeviceSummary)")
         if PrefKey.prewarmOCRDefault {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 OCR.prewarm()
@@ -44,6 +45,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             Log.info("OCR: 预热已关闭（首次截图会等模型加载）")
         }
+
+        // 睡眠会让 ANE 掉电，模型页也会变冷。唤醒后主动热一次，
+        // 免得第一次截图撞在「句柄已失效」的半死状态上（2026-11-14 那次就是这么坏的）。
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleSystemWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
 
         // 自检入口：launchctl setenv PEEK_SHOW_ON_LAUNCH 1 && open -a Peek
         if ProcessInfo.processInfo.environment["PEEK_SHOW_ON_LAUNCH"] != nil {
@@ -135,13 +145,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
+            // enhance=auto|off|force：排查时用来只跑一条路径，看是哪一条坏了
+            let enhanceName = (note.userInfo?["enhance"] as? String) ?? "auto"
+            let enhance: OCR.Enhance = enhanceName == "off" ? .off
+                : (enhanceName == "force" ? .force : .auto)
+
             DispatchQueue.global(qos: .userInitiated).async {
                 let outcome = Result {
                     guard let image = NSImage(contentsOfFile: path)?
                         .cgImage(forProposedRect: nil, context: nil, hints: nil) else {
                         throw OCR.OCRError.imageUnreadable
                     }
-                    return try OCR.recognize(image)
+                    return try OCR.recognizeRobust(image, enhance: enhance)
                 }
                 DispatchQueue.main.async {
                     switch outcome {
@@ -347,6 +362,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    /// 系统唤醒后重新把 OCR 模型拉起来。
+    /// 睡眠期间 ANE 掉电、模型页被回收，旧进程里那份句柄可能已经失效；
+    /// 唤醒后立刻跑一次，成功就顺手重启保活，失败会走诊断日志。
+    /// 关掉预热的人不希望模型常驻，就不替他加载。
+    @objc private func handleSystemWake() {
+        guard PrefKey.prewarmOCRDefault else {
+            Log.info("系统唤醒: OCR 预热已关闭，跳过")
+            return
+        }
+        Log.info("系统唤醒: 重新预热 OCR")
+        OCR.prewarm()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

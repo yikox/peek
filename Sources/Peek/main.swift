@@ -1,5 +1,12 @@
 import AppKit
 
+// 独立 OCR 进程。必须是**第一条**：下面那句 `NSApplication.shared` 一旦执行，
+// 进程就进入 GUI 环境 —— 而 GUI 环境正是 Vision 冷加载后失效的那个环境
+// （见 OCRBridge 与 OCR.swift 里的说明）。
+if CommandLine.arguments.contains("--ocr-server") {
+    Verify.runOCRServer()
+}
+
 let app = NSApplication.shared
 
 /// 取某个 flag 后面的值

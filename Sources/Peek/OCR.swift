@@ -1,4 +1,5 @@
 import AppKit
+import CoreML
 import Vision
 
 /// 文字识别：Vision 的 VNRecognizeTextRequest。
@@ -48,10 +49,63 @@ enum OCR {
     }
 
     /// 所有识别串行化。
-    /// Vision 在模型冷加载（新进程首次，实测 15~48 秒）之后并发调用会互相拖垮，
-    /// 底层的 `e5rt_execution_stream_operation_create...` 直接失败，外层报
-    /// `CRImageReaderError error 1`。串行还顺带保证「预热没跑完，识别不会挤进去」。
-    private static let queue = DispatchQueue(label: "com.peek.ocr", qos: .userInitiated)
+    ///
+    /// 队列 QoS 必须是 userInteractive：首次冷加载（实测 13~48 秒）期间，
+    /// 低优先级会让 e5rt 的初始化线程被降频/推迟，加载"看起来成功了"但进程
+    /// 之后所有识别都报 `CRImageReaderError 1`（2026-11-14 定位）。
+    private static let queue = DispatchQueue(label: "com.peek.ocr", qos: .userInteractive)
+
+    // MARK: - 计算设备
+
+    /// 按名字取设备。macOS 14 之前没有这套 API，只能走默认。
+    @available(macOS 14.0, *)
+    static func device(named name: String) -> MLComputeDevice? {
+        let all = MLComputeDevice.allComputeDevices
+        switch name {
+        case "cpu":
+            return all.first { if case .cpu = $0 { return true }; return false }
+        case "gpu":
+            return all.first { if case .gpu = $0 { return true }; return false }
+        case "ane":
+            return all.first { if case .neuralEngine = $0 { return true }; return false }
+        default:
+            return nil          // "default"：交给系统挑，通常是 ANE
+        }
+    }
+
+    /// 首选设备。**默认 CPU**，用 `PEEK_OCR_DEVICE=cpu|gpu|ane|default` 可以改。
+    ///
+    /// 为什么默认不用 ANE（2026-11-14 实测，macOS 27）：
+    /// - 速度更快：同一张 900×220，默认（ANE）174ms / 167ms，CPU 83ms / 63ms；
+    /// - 更抗睡眠：进程夜里闲置 10 小时后，ANE 上下文已随睡眠掉电失效，
+    ///   第二天第一次调用就 `CRImageReaderError 1`，而且**整个进程之后所有识别全废**，
+    ///   直到重启。同一时刻一个新进程却能正常冷加载成功（14.2s），说明系统没坏，
+    ///   是旧进程里那份失效的 ANE 句柄无法重建。
+    ///
+    /// 注意：CPU 只是绕开 ANE，不能保证免于「模型页被回收」这个更底层的问题，
+    /// 所以下面还有阶梯重试和保活（`startKeepAlive`）。
+    /// 不能是 private：run() 的默认参数要用它，默认参数在调用点求值，要求可达
+    static var preferredDeviceName: String {
+        ProcessInfo.processInfo.environment["PEEK_OCR_DEVICE"] ?? "cpu"
+    }
+    /// 失败后依次尝试的设备链路。
+    /// 每次尝试都会新建 request 和 handler —— 换设备等于换一条 e5rt 流，
+    /// 这是进程内唯一还可能自救的手段。
+    private static var deviceLadder: [String] {
+        let first = preferredDeviceName
+        let rest = ["cpu", "default", "gpu"].filter { $0 != first }
+        return [first] + rest
+    }
+
+    /// 启动日志用：说清楚这次到底走哪条路
+    static var debugDeviceSummary: String {
+        let name = preferredDeviceName
+        guard #available(macOS 14.0, *) else { return "\(name)（系统低于 14，无法指定）" }
+        let count = MLComputeDevice.allComputeDevices.count
+        return device(named: name) == nil
+            ? "\(name)（找不到，退回系统默认；可选 \(count) 个）"
+            : "\(name)（可用，共 \(count) 个设备）"
+    }
 
     /// 把任意 CGImage 规范成统一位图格式：8-bit / 32bpp / BGRA 预乘 / DeviceRGB。
     ///
@@ -81,41 +135,116 @@ enum OCR {
     }
 
     /// 同步识别。调用方负责放到后台队列（大图耗时几十到几百毫秒）。
+    ///
+    /// 失败不是重试同一个设备，而是**换设备重来**：同一设备上失败后状态已经脏了
+    /// （旧进程那种「一次失败、此后全废」就是这么来的），换设备会新建 request、
+    /// 新建 handler、走另一条执行流，这是进程内唯一还可能自救的手段。
     static func recognize(_ image: CGImage,
                          languages: [String] = ["zh-Hans", "en-US"],
                          enhance: Enhance = .auto) throws -> Result {
         try queue.sync {
+            var lastError: Error?
+            let ladder = deviceLadder
+            for (index, deviceName) in ladder.enumerated() {
+                if index > 0 {
+                    Log.info("OCR: 换设备重试 #\(index)（\(deviceName)）")
+                    Thread.sleep(forTimeInterval: 0.3)
+                }
+                do {
+                    let result = try recognizeOnce(image, languages: languages,
+                                                   enhance: enhance, deviceName: deviceName)
+                    if index > 0 {
+                        Log.info("OCR: 换设备后成功（\(deviceName)），首选设备 \(ladder[0]) 已失效")
+                    }
+                    return result
+                } catch OCRError.noText {
+                    // 图里就是没字，这是正常结果，换设备也没用
+                    throw OCRError.noText
+                } catch {
+                    lastError = error
+                    Log.info("OCR: 设备 \(deviceName) 失败（\(error.localizedDescription)）")
+                }
+            }
+            throw lastError ?? OCRError.failed("所有计算设备都失败了")
+        }
+    }
+
+    /// 带兜底的识别：先在本进程跑，失败就交给独立进程。
+    ///
+    /// 存在的唯一原因：GUI 进程在模型冷加载之后视觉计算会整体失效，
+    /// 而且进程内没有任何 API 能重置（详见 OCRBridge 的注释）。
+    /// `noText` 不触发兜底 —— 那是「图里真没字」，换个进程结果一样。
+    static func recognizeRobust(_ image: CGImage,
+                                enhance: Enhance = .auto) throws -> Result {
+        if !forceBridge, !isDegraded {
             do {
-                return try recognizeOnce(image, languages: languages, enhance: enhance)
+                return try recognize(image, enhance: enhance)
             } catch OCRError.noText {
-                // 图里就是没字，这是正常结果，不该重试
                 throw OCRError.noText
             } catch {
-                // 冷加载刚结束时偶发失败很常见：等一拍重试一次，多半能救回来
-                Log.info("OCR: 首次失败（\(error.localizedDescription)），350ms 后重试")
-                Thread.sleep(forTimeInterval: 0.35)
-                return try recognizeOnce(image, languages: languages, enhance: enhance)
+                Log.info("OCR: 本进程识别失败（\(error.localizedDescription)），改走独立进程")
+                markDegraded()
             }
         }
+        return try OCRBridge.shared.recognize(image: image, enhance: enhance)
+    }
+
+    /// `PEEK_OCR_FORCE_BRIDGE=1`：一律走独立进程。
+    /// 排障用（想确认独立进程这条路本身是通的），也可以当逃生阀。
+    private static var forceBridge: Bool {
+        ProcessInfo.processInfo.environment["PEEK_OCR_FORCE_BRIDGE"] != nil
+    }
+
+    // MARK: - 降级状态
+
+    private static let degradeLock = NSLock()
+    private static var degradedUntil: Date?
+    /// 降级有效期。到期后重新给本进程一次机会：唤醒 / 系统回收模型都可能让它自己好起来。
+    private static let degradeWindow: TimeInterval = 5 * 60
+
+    /// 本进程这条路是不是刚翻过车。
+    /// 翻车后一段时间内直接走独立进程 —— 否则每次都要先花 0.7 秒试三个注定失败的设备。
+    private static var isDegraded: Bool {
+        degradeLock.lock()
+        defer { degradeLock.unlock() }
+        guard let until = degradedUntil else { return false }
+        return until > Date()
+    }
+
+    private static func markDegraded() {
+        degradeLock.lock()
+        degradedUntil = Date().addingTimeInterval(degradeWindow)
+        degradeLock.unlock()
+    }
+
+    /// 预热成功后调用：说明本进程这条路又通了，撤掉降级。
+    static func clearDegraded() {
+        degradeLock.lock()
+        degradedUntil = nil
+        degradeLock.unlock()
     }
 
     private static func recognizeOnce(_ image: CGImage,
                                       languages: [String],
-                                      enhance: Enhance) throws -> Result {
+                                      enhance: Enhance,
+                                      deviceName: String) throws -> Result {
         let start = Date()
         let plainVariant = "原图"
         let boostedVariant = "增强"
 
         switch enhance {
         case .off:
-            return try run(image, languages: languages, origin: start, variant: plainVariant)
+            return try run(image, languages: languages, origin: start,
+                           variant: plainVariant, deviceName: deviceName)
 
         case .force:
             if let boosted = prepared(image),
-               let result = try? run(boosted, languages: languages, origin: start, variant: boostedVariant) {
+               let result = try? run(boosted, languages: languages, origin: start,
+                                     variant: boostedVariant, deviceName: deviceName) {
                 return result
             }
-            return try run(image, languages: languages, origin: start, variant: plainVariant)
+            return try run(image, languages: languages, origin: start,
+                           variant: plainVariant, deviceName: deviceName)
 
         case .auto:
             // 两路都跑，按"行数"选优。
@@ -129,7 +258,8 @@ enum OCR {
             var plain: Result?
             var plainError: Error?
             do {
-                plain = try run(image, languages: languages, origin: start, variant: plainVariant)
+                plain = try run(image, languages: languages, origin: start,
+                                variant: plainVariant, deviceName: deviceName)
             } catch {
                 plainError = error
             }
@@ -140,8 +270,8 @@ enum OCR {
             }
 
             guard let boosted = prepared(image),
-                  let alternative = try? run(boosted, languages: languages,
-                                             origin: start, variant: boostedVariant) else {
+                  let alternative = try? run(boosted, languages: languages, origin: start,
+                                             variant: boostedVariant, deviceName: deviceName) else {
                 if let plain { return plain }
                 throw plainError ?? OCRError.noText
             }
@@ -168,7 +298,9 @@ enum OCR {
     /// `CRImageReaderError 1`（底层 `e5rt_execution_stream...`），直到重启。
     /// 换成 900×220 的合成文字图后，冷启动那次 1.1 秒、之后每次 60~110ms 全部正常。
     static func prewarm() {
-        DispatchQueue.global(qos: .utility).async {
+        // 用 userInitiated 而不是 utility：冷加载十几秒，低优先级会被系统压得更慢，
+        // 而且容易让底层的模型加载走成半成品状态（见 queue 的注释）。
+        DispatchQueue.global(qos: .userInitiated).async {
             guard let image = warmupImage() else {
                 Log.info("OCR: 预热跳过（合成不出预热图）")
                 return
@@ -177,15 +309,70 @@ enum OCR {
             do {
                 let result = try recognize(image, enhance: .off)
                 Log.info("OCR: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms，\(result.lines.count) 行「\(result.text.prefix(20))」")
+                // 本进程这条路是通的，撤掉降级（唤醒 / 系统回收模型都可能让它自己恢复）
+                clearDegraded()
+                // 模型已经在内存里了，从现在开始定期碰它一下，别让系统把页回收掉
+                startKeepAlive()
             } catch {
                 Log.info("OCR: 预热失败 \(error.localizedDescription)")
             }
         }
     }
 
+    // MARK: - 保活
+
+    private static let keepAliveLock = NSLock()
+    private static var keepAliveTimer: DispatchSourceTimer?
+    private static let keepAliveInterval: TimeInterval = 20 * 60
+
+    /// 每 20 分钟轻点一次模型，让它别被系统当成冷页回收。
+    ///
+    /// 为什么需要：Peek 是常驻应用，用户可能一整天不截图。2026-11-14 那次故障
+    /// 就是「夜里闲置 10 小时后，早上第一次识别必失败」—— 模型页已被系统回收，
+    /// 而进程里那份 Vision 全局状态重建不出来（新进程却能正常冷加载成功）。
+    /// 一次空识别约 60ms CPU，20 分钟一次，一天合计 4 秒左右。
+    static func startKeepAlive() {
+        keepAliveLock.lock()
+        defer { keepAliveLock.unlock() }
+        guard keepAliveTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + keepAliveInterval,
+                       repeating: keepAliveInterval,
+                       leeway: .seconds(60))
+        timer.setEventHandler { keepAliveTick() }
+        timer.resume()
+        keepAliveTimer = timer
+        Log.info("OCR: 保活已启动（每 \(Int(keepAliveInterval / 60)) 分钟轻点一次模型）")
+    }
+
+    static func stopKeepAlive() {
+        keepAliveLock.lock()
+        defer { keepAliveLock.unlock() }
+        keepAliveTimer?.cancel()
+        keepAliveTimer = nil
+    }
+
+    static var isKeepingAlive: Bool {
+        keepAliveLock.lock()
+        defer { keepAliveLock.unlock() }
+        return keepAliveTimer != nil
+    }
+
+    private static func keepAliveTick() {
+        guard let image = warmupImage() else { return }
+        do {
+            _ = try recognize(image, enhance: .off)
+        } catch {
+            // 保活都失败了说明这条进程已经废了，再空转只会刷日志
+            Log.info("OCR: 保活失败（\(error.localizedDescription)）—— 模型已不可用，停止保活")
+            stopKeepAlive()
+        }
+    }
+
     /// 预热用的合成图：白底黑字，900×220。
     /// 走 CoreText 而不是 NSImage.lockFocus —— 后者要求主线程，预热跑在后台队列。
-    private static func warmupImage() -> CGImage? {
+    /// 独立识别进程（--ocr-server）也要用它先热模型，所以不能是 private。
+    static func warmupImage() -> CGImage? {
         let width = 900, height = 220
         // 格式必须和 normalize() 的目标格式一致，否则预热那一枪和后续识别的 shape 不同
         guard let context = CGContext(data: nil, width: width, height: height,
@@ -301,9 +488,12 @@ enum OCR {
     static func run(_ image: CGImage,
                     languages: [String] = ["zh-Hans", "en-US"],
                     origin: Date = Date(),
-                    variant: String) throws -> Result {
+                    variant: String,
+                    deviceName: String = OCR.preferredDeviceName) throws -> Result {
         // 统一像素格式：Vision 冷加载后只认「和首次调用同格式」的输入，格式一变就建流失败
-        let image = normalize(image)
+        let original = image
+        let image = normalize(original)
+        Log.info("OCR[\(variant)] 输入 \(original.width)×\(original.height) bpc=\(original.bitsPerComponent) bpp=\(original.bitsPerPixel) a=\(original.alphaInfo.rawValue) cs=\(original.colorSpace?.name as String? ?? "nil") → a=\(image.alphaInfo.rawValue) bpp=\(image.bitsPerPixel) 设备=\(deviceName)")
 
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
@@ -311,6 +501,11 @@ enum OCR {
         request.recognitionLanguages = languages
         // 关闭自动语种检测：开了以后会忽略我们指定的顺序，中文小字容易掉
         request.automaticallyDetectsLanguage = false
+        // 指定计算设备：默认 CPU，见 preferredDeviceName 的说明。
+        // macOS 14 之前没有这个 API，只能交给系统。
+        if #available(macOS 14.0, *), let picked = device(named: deviceName) {
+            request.setComputeDevice(picked, for: .main)
+        }
 
         let handler = VNImageRequestHandler(cgImage: image, options: [:])
         do {
