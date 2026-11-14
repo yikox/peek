@@ -92,6 +92,7 @@ extension Verify {
         }
         do {
             let result = try OCR.recognize(warm, enhance: .off)
+            OCRWarmMarker.write()
             print("warmup ok \(Int(-start.timeIntervalSinceNow * 1000))ms \(result.lines.count) lines")
             exit(0)
         } catch {

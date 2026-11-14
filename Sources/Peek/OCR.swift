@@ -264,6 +264,12 @@ enum OCR {
         startKeepAlive()
     }
 
+    /// 睡眠唤醒后调用：模型页可能已被回收，不管「本次开机已编译」标记，强制重来一次。
+    static func rewarm() {
+        OCRBridge.shared.rewarm()
+        startKeepAlive()
+    }
+
     // MARK: - 保活
 
     private static let keepAliveLock = NSLock()

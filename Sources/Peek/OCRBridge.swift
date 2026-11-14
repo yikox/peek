@@ -72,6 +72,15 @@ final class OCRBridge {
         }
     }
 
+    /// 睡眠唤醒后强制执行一次（模型页可能已被回收，`--ocr-warmup` 那次的编译结果也可能失效）。
+    func rewarm() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.warmedThisRun = true
+            self.performWarmup(force: true)
+        }
+    }
+
     var isHelperRunning: Bool {
         process?.isRunning ?? false
     }
@@ -82,14 +91,18 @@ final class OCRBridge {
     private func ensureWarmLocked() {
         guard !warmedThisRun else { return }
         warmedThisRun = true
-        performWarmup()
+        performWarmup(force: false)
     }
 
     /// 冷编译：拉起 `--ocr-warmup`，等它自己跑完退出。
     ///
     /// 那个进程跑完一次识别就会进入坏状态，但这无所谓 —— 它马上就死了，
     /// 而编译结果留在系统里，后面的 `--ocr-server` 直接是热的。
-    private func performWarmup() {
+    private func performWarmup(force: Bool) {
+        if !force, OCRWarmMarker.matchesThisBoot() {
+            Log.info("OCR bridge: 本次开机已经编译过，跳过冷编译")
+            return
+        }
         let start = Date()
         let task = Process()
         task.executableURL = executableURL
@@ -243,5 +256,48 @@ final class OCRBridge {
             process.terminate()
         }
         process = nil
+    }
+}
+
+/// 「本次开机已经冷编译过」的标记。
+///
+/// 编译结果跨进程共享，所以重启 App 没必要再花十几秒重来一遍。
+/// 用开机时间当 key：关机重启后自动失效。
+enum OCRWarmMarker {
+
+    static var bootTime: Int {
+        var tv = timeval()
+        var size = MemoryLayout<timeval>.stride
+        guard sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 else { return 0 }
+        return tv.tv_sec
+    }
+
+    private static var url: URL {
+        let fm = FileManager.default
+        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Peek", isDirectory: true)
+        if !fm.fileExists(atPath: dir.path) {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir.appendingPathComponent("ocr-warmed.json")
+    }
+
+    /// 本次开机内是否已经编译过。
+    static func matchesThisBoot() -> Bool {
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let boot = obj["boot"] as? Int else { return false }
+        return boot != 0 && boot == bootTime
+    }
+
+    static func write() {
+        let object: [String: Any] = ["boot": bootTime, "at": Date().timeIntervalSince1970]
+        if let data = try? JSONSerialization.data(withJSONObject: object) {
+            try? data.write(to: url, options: [.atomic])
+        }
+    }
+
+    static func clear() {
+        try? FileManager.default.removeItem(at: url)
     }
 }

@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
@@ -35,15 +36,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.info("剪贴板历史: 记录已关闭，不启动轮询")
         }
 
-        // OCR 预热：Vision 冷启动要十几秒，启动后先在后台把模型拉起来。
-        // 代价是模型常驻内存（实测 19 MB → 稳定 53 MB，加载瞬间峰值 84 MB），所以给一个开关。
+        // OCR 冷编译：Vision 第一次调用要编译模型，实测 13~14 秒（热态 200~400ms）。
+        // 登录后立刻在后台做，这样用户第一次按 ⌥S 不用等；编译放在一次性进程里，
+        // 不会污染主进程（见 OCRBridge 的说明）。
         Log.info("OCR: 计算设备 \(OCR.debugDeviceSummary)")
         if PrefKey.prewarmOCRDefault {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            // 不延迟：越早编译完，用户第一次截图越可能赶上热的
+            DispatchQueue.global(qos: .userInitiated).async {
                 OCR.prewarm()
             }
         } else {
-            Log.info("OCR: 预热已关闭（首次截图会等模型加载）")
+            Log.info("OCR: 预热已关闭（首次截图会等模型编译）")
         }
 
         // 睡眠会让 ANE 掉电，模型页也会变冷。唤醒后主动热一次，
@@ -226,6 +229,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SettingsWindow.shared.debugClose()
         }
 
+        // 开机自启自检：loginStatus / loginOn / loginOff
+        for (name, action) in [("loginStatus", 0), ("loginOn", 1), ("loginOff", 2)] {
+            DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name("com.peek.translator.\(name)"),
+                object: nil,
+                queue: .main
+            ) { _ in
+                let service = SMAppService.mainApp
+                if action != 0 {
+                    do {
+                        if action == 1 { try service.register() } else { try service.unregister() }
+                    } catch {
+                        Log.info("开机自启: 操作失败 \(error.localizedDescription)")
+                    }
+                }
+                Log.info("开机自启: 状态 \(Self.launchStatusText(service.status))")
+            }
+        }
+
         // 外部触发：打开剪贴板历史窗（自检 / 调试用，等价于按 ⌥Z）
         DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.peek.translator.showClipboardHistory"),
@@ -368,13 +390,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 睡眠期间 ANE 掉电、模型页被回收，旧进程里那份句柄可能已经失效；
     /// 唤醒后立刻跑一次，成功就顺手重启保活，失败会走诊断日志。
     /// 关掉预热的人不希望模型常驻，就不替他加载。
+    static func launchStatusText(_ status: SMAppService.Status) -> String {
+        switch status {
+        case .enabled: return "已开启"
+        case .notRegistered: return "未注册"
+        case .notFound: return "未找到（包不在 /Applications？）"
+        case .requiresApproval: return "等待用户在系统设置里批准"
+        @unknown default: return "未知(\(status.rawValue))"
+        }
+    }
+
     @objc private func handleSystemWake() {
         guard PrefKey.prewarmOCRDefault else {
             Log.info("系统唤醒: OCR 预热已关闭，跳过")
             return
         }
         Log.info("系统唤醒: 重新预热 OCR")
-        OCR.prewarm()
+        OCR.rewarm()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
