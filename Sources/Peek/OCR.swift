@@ -169,59 +169,20 @@ enum OCR {
         }
     }
 
-    /// 带兜底的识别：先在本进程跑，失败就交给独立进程。
+    /// 识别入口。**默认全部交给独立进程**，GUI 进程自己一次 Vision 都不碰。
     ///
-    /// 存在的唯一原因：GUI 进程在模型冷加载之后视觉计算会整体失效，
-    /// 而且进程内没有任何 API 能重置（详见 OCRBridge 的注释）。
-    /// `noText` 不触发兜底 —— 那是「图里真没字」，换个进程结果一样。
+    /// 为什么不是「先在本进程试，失败再兜底」：冷编译那一次调用会污染执行它的进程，
+    /// 而 GUI 进程是常驻的 —— 一旦被污染就再也恢复不了，每次识别都得先花 0.7 秒
+    /// 试三个注定失败的设备再兜底。反过来，「冷编译 + 识别」都放在用完就退的独立进程里，
+    /// 主进程永远干净。
+    ///
+    /// 排障时可以 `PEEK_OCR_INPROC=1` 强制走进程内路径。
     static func recognizeRobust(_ image: CGImage,
                                 enhance: Enhance = .auto) throws -> Result {
-        if !forceBridge, !isDegraded {
-            do {
-                return try recognize(image, enhance: enhance)
-            } catch OCRError.noText {
-                throw OCRError.noText
-            } catch {
-                Log.info("OCR: 本进程识别失败（\(error.localizedDescription)），改走独立进程")
-                markDegraded()
-            }
+        if ProcessInfo.processInfo.environment["PEEK_OCR_INPROC"] != nil {
+            return try recognize(image, enhance: enhance)
         }
         return try OCRBridge.shared.recognize(image: image, enhance: enhance)
-    }
-
-    /// `PEEK_OCR_FORCE_BRIDGE=1`：一律走独立进程。
-    /// 排障用（想确认独立进程这条路本身是通的），也可以当逃生阀。
-    private static var forceBridge: Bool {
-        ProcessInfo.processInfo.environment["PEEK_OCR_FORCE_BRIDGE"] != nil
-    }
-
-    // MARK: - 降级状态
-
-    private static let degradeLock = NSLock()
-    private static var degradedUntil: Date?
-    /// 降级有效期。到期后重新给本进程一次机会：唤醒 / 系统回收模型都可能让它自己好起来。
-    private static let degradeWindow: TimeInterval = 5 * 60
-
-    /// 本进程这条路是不是刚翻过车。
-    /// 翻车后一段时间内直接走独立进程 —— 否则每次都要先花 0.7 秒试三个注定失败的设备。
-    private static var isDegraded: Bool {
-        degradeLock.lock()
-        defer { degradeLock.unlock() }
-        guard let until = degradedUntil else { return false }
-        return until > Date()
-    }
-
-    private static func markDegraded() {
-        degradeLock.lock()
-        degradedUntil = Date().addingTimeInterval(degradeWindow)
-        degradeLock.unlock()
-    }
-
-    /// 预热成功后调用：说明本进程这条路又通了，撤掉降级。
-    static func clearDegraded() {
-        degradeLock.lock()
-        degradedUntil = nil
-        degradeLock.unlock()
     }
 
     private static func recognizeOnce(_ image: CGImage,
@@ -289,34 +250,18 @@ enum OCR {
         }
     }
 
-    /// 预热：首次调用 Vision 要加载模型，实测冷启动 15~48 秒、热态 100~200ms。
-    /// 启动后后台跑一次真识别，把模型留在内存里，第一次截图才不用等。
+    /// 预热交给**一次性进程**做，不要在 GUI 进程里跑。
     ///
-    /// **预热图必须是一张正常尺寸、真有文字的图**，不能用 8×8 空白图。
-    /// 实测（macOS 27）：冷启动时若第一条流喂的是极小尺寸，
-    /// 之后真实尺寸的流就再也建不起来 —— 进程内所有识别持续报
-    /// `CRImageReaderError 1`（底层 `e5rt_execution_stream...`），直到重启。
-    /// 换成 900×220 的合成文字图后，冷启动那次 1.1 秒、之后每次 60~110ms 全部正常。
+    /// 2026-11-14 实测（macOS 27 / 16 GB）：冷编译那一次调用本身会「污染」执行它的进程 ——
+    /// 第一次调用返回结果（或空结果），紧接着同一个进程里的第二次调用必报
+    /// `CRImageReaderError 1`，换设备、换格式、换尺寸都救不回来。
+    /// 而冷编译完成后**新起的进程**（编译结果已在系统里）连续识别一切正常。
+    ///
+    /// 所以：冷编译放在 `--ocr-warmup` 那个用完就退的进程里，真正的识别交给
+    /// 冷编译之后才启动的 `--ocr-server`。GUI 进程自己一次 Vision 都不碰。
     static func prewarm() {
-        // 用 userInitiated 而不是 utility：冷加载十几秒，低优先级会被系统压得更慢，
-        // 而且容易让底层的模型加载走成半成品状态（见 queue 的注释）。
-        DispatchQueue.global(qos: .userInitiated).async {
-            guard let image = warmupImage() else {
-                Log.info("OCR: 预热跳过（合成不出预热图）")
-                return
-            }
-            let start = Date()
-            do {
-                let result = try recognize(image, enhance: .off)
-                Log.info("OCR: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms，\(result.lines.count) 行「\(result.text.prefix(20))」")
-                // 本进程这条路是通的，撤掉降级（唤醒 / 系统回收模型都可能让它自己恢复）
-                clearDegraded()
-                // 模型已经在内存里了，从现在开始定期碰它一下，别让系统把页回收掉
-                startKeepAlive()
-            } catch {
-                Log.info("OCR: 预热失败 \(error.localizedDescription)")
-            }
-        }
+        OCRBridge.shared.warmupInBackground()
+        startKeepAlive()
     }
 
     // MARK: - 保活
@@ -361,11 +306,13 @@ enum OCR {
     private static func keepAliveTick() {
         guard let image = warmupImage() else { return }
         do {
-            _ = try recognize(image, enhance: .off)
+            _ = try OCRBridge.shared.recognize(image: image, enhance: .off)
+            Log.info("OCR: 保活通过")
+        } catch OCRError.noText {
+            // 空图认不出字也说明链路通、模型在
+            Log.info("OCR: 保活通过（空图无文字）")
         } catch {
-            // 保活都失败了说明这条进程已经废了，再空转只会刷日志
-            Log.info("OCR: 保活失败（\(error.localizedDescription)）—— 模型已不可用，停止保活")
-            stopKeepAlive()
+            Log.info("OCR: 保活失败（\(error.localizedDescription)）")
         }
     }
 

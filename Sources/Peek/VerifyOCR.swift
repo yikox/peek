@@ -79,23 +79,36 @@ extension Verify {
         for line in result.lines { print("    | \(line)") }
     }
 
+    /// Peek --ocr-warmup：**一次性**冷编译进程，跑完一次就退。
+    ///
+    /// 冷编译会把执行它的进程弄坏（第一次调用之后，同一进程里所有识别都报
+    /// `CRImageReaderError 1`），但编译结果会留在系统里。所以让这个进程去踩雷、
+    /// 踩完就死，紧接着启动的 `--ocr-server` 就是干净的、热的。
+    static func runOCRWarmup() -> Never {
+        let start = Date()
+        guard let warm = OCR.warmupImage() else {
+            print("no warmup image")
+            exit(1)
+        }
+        do {
+            let result = try OCR.recognize(warm, enhance: .off)
+            print("warmup ok \(Int(-start.timeIntervalSinceNow * 1000))ms \(result.lines.count) lines")
+            exit(0)
+        } catch {
+            print("warmup failed \(error.localizedDescription)")
+            exit(2)
+        }
+    }
+
     /// Peek --ocr-server：常驻识别进程，按行收发 JSON。
     ///
     /// 由 `OCRBridge` 从 GUI 主进程里拉起来。为什么不在主进程里直接识别：
-    /// macOS 27 + 16 GB 机器上，GUI 进程在 Vision 模型冷加载之后会让视觉计算路径
-    /// 进入不可恢复的坏状态（三个设备全报 `CRImageReaderError 1`），
-    /// 而命令行进程同样的冷加载却能正常工作。独立进程还有个好处 —— 坏了能杀掉重来。
+    /// macOS 27 + 16 GB 机器上，**冷编译**会让执行它的进程进入不可恢复的坏状态
+    /// （三个设备全报 `CRImageReaderError 1`），而冷编译之后新起的进程一切正常。
+    /// 所以这个进程不做预热 —— 它启动时模型通常已经被 `--ocr-warmup` 编译好了；
+    /// 万一没有，第一枪由这次真实请求去踩，代价是一次十几秒的编译。
     static func runOCRServer() -> Never {
         Log.info("OCR 独立进程: 启动 pid=\(getpid())")
-        if let warm = OCR.warmupImage() {
-            let start = Date()
-            do {
-                let result = try OCR.recognize(warm, enhance: .off)
-                Log.info("OCR 独立进程: 预热完成 \(Int(-start.timeIntervalSinceNow * 1000))ms，\(result.lines.count) 行")
-            } catch {
-                Log.info("OCR 独立进程: 预热失败 \(error.localizedDescription)")
-            }
-        }
 
         // 必须用 POSIX read：FileHandle.read(upToCount:) 会一直阻塞到读满 64 KB 或 EOF，
         // 常驻模式下对端不会关管道，就永远等不到第一行。

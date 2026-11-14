@@ -7,6 +7,11 @@ if CommandLine.arguments.contains("--ocr-server") {
     Verify.runOCRServer()
 }
 
+// 一次性冷编译进程：踩完雷就退，给后面的 --ocr-server 留一个干净环境。
+if CommandLine.arguments.contains("--ocr-warmup") {
+    Verify.runOCRWarmup()
+}
+
 let app = NSApplication.shared
 
 /// 取某个 flag 后面的值
