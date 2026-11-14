@@ -959,7 +959,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
         defaults.set(autoCopyCheck.state == .on, forKey: PrefKey.autoCopy)
 
-        // OCR 预热开关：关掉后在本次进程里模型不会立刻释放，提示用户重启
+        // OCR 预热开关：关掉后不再提前编译，第一次识别要当场等模型编译
         let wantsPrewarm = prewarmCheck.state == .on
         let hadPrewarm = PrefKey.prewarmOCRDefault
         if wantsPrewarm != hadPrewarm {
@@ -967,7 +967,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             if wantsPrewarm {
                 OCR.prewarm()
             } else {
-                Log.info("OCR 预热: 已关闭（本次进程内模型仍在，重启后释放）")
+                Log.info("OCR 预热: 已关闭（首次识别会当场编译，要等十几秒）")
             }
         }
 

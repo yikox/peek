@@ -169,14 +169,14 @@ enum OCR {
         }
     }
 
-    /// 识别入口。**默认全部交给独立进程**，GUI 进程自己一次 Vision 都不碰。
+    /// 识别入口。**默认全部交给一次性独立进程**，GUI 进程自己一次 Vision 都不碰。
     ///
-    /// 为什么不是「先在本进程试，失败再兜底」：冷编译那一次调用会污染执行它的进程，
-    /// 而 GUI 进程是常驻的 —— 一旦被污染就再也恢复不了，每次识别都得先花 0.7 秒
-    /// 试三个注定失败的设备再兜底。反过来，「冷编译 + 识别」都放在用完就退的独立进程里，
-    /// 主进程永远干净。
+    /// 为什么不是「先在本进程试，失败再兜底」：Vision 的推理上下文（e5rt）在一个进程里
+    /// 放久了会失效 —— 闲置二十分钟左右再调用就报 `CRImageReaderError 1`，且进程内
+    /// 重建不出来。GUI 进程是常驻的，一定会踩到。反过来，每次识别起一个用完就退的进程，
+    /// 永远是「进程内第一次调用」，实测 236~248ms 稳定成功。
     ///
-    /// 排障时可以 `PEEK_OCR_INPROC=1` 强制走进程内路径。
+    /// 排障时可以 `PEEK_OCR_INPROC=1` 强制走进程内路径（短时间连续调用是没问题的）。
     static func recognizeRobust(_ image: CGImage,
                                 enhance: Enhance = .auto) throws -> Result {
         if ProcessInfo.processInfo.environment["PEEK_OCR_INPROC"] != nil {
@@ -250,77 +250,25 @@ enum OCR {
         }
     }
 
-    /// 预热交给**一次性进程**做，不要在 GUI 进程里跑。
+    /// 冷编译交给**一次性进程**做，不要在 GUI 进程里跑。
     ///
-    /// 2026-11-14 实测（macOS 27 / 16 GB）：冷编译那一次调用本身会「污染」执行它的进程 ——
-    /// 第一次调用返回结果（或空结果），紧接着同一个进程里的第二次调用必报
-    /// `CRImageReaderError 1`，换设备、换格式、换尺寸都救不回来。
-    /// 而冷编译完成后**新起的进程**（编译结果已在系统里）连续识别一切正常。
+    /// 2026-11-15 修正（macOS 27 / 16 GB）：之前认为「冷编译会污染进程」，实测是错的 ——
+    /// 同一进程连续识别 5 次全成功。真正会坏的是**进程闲置一段时间后**（e5rt 推理上下文
+    /// 被系统回收，进程内建不回来，报 `CRImageReaderError 1`）。
     ///
-    /// 所以：冷编译放在 `--ocr-warmup` 那个用完就退的进程里，真正的识别交给
-    /// 冷编译之后才启动的 `--ocr-server`。GUI 进程自己一次 Vision 都不碰。
+    /// 所以识别改成「一次一进程」，永远不踩闲置失效；冷编译仍放在 `--ocr-warmup`
+    /// 那个用完就退的进程里，只为把模型编译结果预热进系统，让后续新进程 250ms 起来。
+    /// GUI 进程自己一次 Vision 都不碰。
     static func prewarm() {
         OCRBridge.shared.warmupInBackground()
-        startKeepAlive()
     }
 
     /// 睡眠唤醒后调用：模型页可能已被回收，不管「本次开机已编译」标记，强制重来一次。
     static func rewarm() {
         OCRBridge.shared.rewarm()
-        startKeepAlive()
     }
 
-    // MARK: - 保活
-
-    private static let keepAliveLock = NSLock()
-    private static var keepAliveTimer: DispatchSourceTimer?
-    private static let keepAliveInterval: TimeInterval = 20 * 60
-
-    /// 每 20 分钟轻点一次模型，让它别被系统当成冷页回收。
-    ///
-    /// 为什么需要：Peek 是常驻应用，用户可能一整天不截图。2026-11-14 那次故障
-    /// 就是「夜里闲置 10 小时后，早上第一次识别必失败」—— 模型页已被系统回收，
-    /// 而进程里那份 Vision 全局状态重建不出来（新进程却能正常冷加载成功）。
-    /// 一次空识别约 60ms CPU，20 分钟一次，一天合计 4 秒左右。
-    static func startKeepAlive() {
-        keepAliveLock.lock()
-        defer { keepAliveLock.unlock() }
-        guard keepAliveTimer == nil else { return }
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + keepAliveInterval,
-                       repeating: keepAliveInterval,
-                       leeway: .seconds(60))
-        timer.setEventHandler { keepAliveTick() }
-        timer.resume()
-        keepAliveTimer = timer
-        Log.info("OCR: 保活已启动（每 \(Int(keepAliveInterval / 60)) 分钟轻点一次模型）")
-    }
-
-    static func stopKeepAlive() {
-        keepAliveLock.lock()
-        defer { keepAliveLock.unlock() }
-        keepAliveTimer?.cancel()
-        keepAliveTimer = nil
-    }
-
-    static var isKeepingAlive: Bool {
-        keepAliveLock.lock()
-        defer { keepAliveLock.unlock() }
-        return keepAliveTimer != nil
-    }
-
-    private static func keepAliveTick() {
-        guard let image = warmupImage() else { return }
-        do {
-            _ = try OCRBridge.shared.recognize(image: image, enhance: .off)
-            Log.info("OCR: 保活通过")
-        } catch OCRError.noText {
-            // 空图认不出字也说明链路通、模型在
-            Log.info("OCR: 保活通过（空图无文字）")
-        } catch {
-            Log.info("OCR: 保活失败（\(error.localizedDescription)）")
-        }
-    }
+    // MARK: - 预热用图
 
     /// 预热用的合成图：白底黑字，900×220。
     /// 走 CoreText 而不是 NSImage.lockFocus —— 后者要求主线程，预热跑在后台队列。

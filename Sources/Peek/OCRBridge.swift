@@ -1,18 +1,20 @@
 import AppKit
 import Foundation
 
-/// 把 OCR 全部交给**独立进程**跑，GUI 主进程一次 Vision 都不碰。
+/// 把 OCR 交给**一次性的独立进程**：一次识别一个进程，出结果就退。
 ///
-/// 为什么（2026-11-14 实测定论）：
-/// 冷编译那一次调用会把执行它的进程弄坏 —— 第一次调用还能出结果，之后同一个进程里
-/// 所有识别都报 `TextRecognition.CRImageReaderError error 1`（底层 e5rt 建流失败），
-/// 换设备 / 换像素格式 / 换尺寸都救不回来。冷编译之后**新起的进程**则完全正常。
+/// 为什么（2026-11-15 实测定论，推翻 11-14 那版「冷编译污染」的结论）：
+/// - 同一个进程里连续跑识别**不会**坏 —— 实测连跑 5 次全成功，第 1 次 316ms、之后 ~100ms；
+/// - 真正会坏的是「进程闲置一段时间之后」：日志里失败点全部落在保活 ping 的 20 分钟间隔上
+///   （14:30 / 14:50 / 15:30 / 15:50 …），杀掉重启立刻恢复。底层 e5rt 的推理上下文
+///   被系统回收后，在同一进程里建不回来，报 `CRImageReaderError 1`；
+/// - 更糟的是失败之后的重启要 **13 秒**（系统刚经历过 e5rt 报错，得重新编译加载），
+///   而全新进程在热态下只要 **236~248ms**。
 ///
-/// 所以这里把两件事分开：
-/// 1. `--ocr-warmup`：一次性进程，专门去踩冷编译这个雷，跑完就死；
-/// 2. `--ocr-server`：冷编译之后才启动的常驻进程，负责真正的识别。
+/// 所以干脆不留常驻进程：每次识别 spawn 一个新进程，永远是「进程内第一次调用」，
+/// 结构上就不可能踩到闲置失效。代价是每次多 ~130ms，换来永不报错、也没有保活定时器。
 ///
-/// 主进程既不做预热也不做识别，因此永远不会被污染。独立进程要是也坏了，杀掉重来。
+/// 冷编译（第一次调用要编译模型，实测 13~44 秒）仍然单独做一次，见 `--ocr-warmup`。
 final class OCRBridge {
 
     static let shared = OCRBridge()
@@ -36,14 +38,10 @@ final class OCRBridge {
     }
 
     private let queue = DispatchQueue(label: "com.peek.ocr.bridge", qos: .userInitiated)
-    private var process: Process?
-    private var toHelper: FileHandle?
-    private var fromHelper: FileHandle?
-    private var buffer = Data()
     /// 本次 App 运行里是否已经做过冷编译
     private var warmedThisRun = false
-    /// 独立进程冷加载要十几秒，给足余量；超时就杀掉重来
-    private let timeout: TimeInterval = 90
+    /// 一次性进程正常 250ms 内出结果；冷启动（模型还没编译过）要给足余量
+    private let timeout: TimeInterval = 30
 
     private init() {}
 
@@ -51,38 +49,35 @@ final class OCRBridge {
     func recognize(image: CGImage, enhance: OCR.Enhance) throws -> OCR.Result {
         try queue.sync {
             ensureWarmLocked()
+            let path = try writePNG(image)
+            defer { try? FileManager.default.removeItem(atPath: path) }
             do {
-                return try runOnHelper(image: image, enhance: enhance)
+                return try runOnce(path: path, enhance: enhance)
             } catch OCR.OCRError.failed(let message) where message.contains("CRImageReader") {
-                // 独立进程自己也被冷编译污染了（说明启动时模型还是冷的）。
-                // 编译结果这会儿肯定已经落盘，换个新进程必然恢复正常。
-                Log.info("OCR bridge: 独立进程报 CRImageReader，杀掉重启后重试")
-                teardown()
-                return try runOnHelper(image: image, enhance: enhance)
+                // 理论上不会走到这里（新进程不该坏）。真踩到了就再来一个进程 ——
+                // 编译结果已经在系统里，重试是毫秒级的。
+                Log.info("OCR bridge: 一次性进程报 CRImageReader，换新进程重试")
+                return try runOnce(path: path, enhance: enhance)
             }
         }
     }
 
-    /// 启动时在后台把冷编译做完（一次性进程），这样第一次截图不用等十几秒。
+    /// 启动时在后台把冷编译做完，这样第一次截图不用等十几秒。
     func warmupInBackground() {
         queue.async { [weak self] in
             guard let self else { return }
             self.ensureWarmLocked()
-            Log.info("OCR bridge: 冷编译就绪，后续识别走独立进程")
+            Log.info("OCR bridge: 冷编译就绪，后续识别走一次性进程")
         }
     }
 
-    /// 睡眠唤醒后强制执行一次（模型页可能已被回收，`--ocr-warmup` 那次的编译结果也可能失效）。
+    /// 睡眠唤醒后强制执行一次（模型页可能已被回收，编译结果也失效了）。
     func rewarm() {
         queue.async { [weak self] in
             guard let self else { return }
             self.warmedThisRun = true
             self.performWarmup(force: true)
         }
-    }
-
-    var isHelperRunning: Bool {
-        process?.isRunning ?? false
     }
 
     // MARK: - 内部
@@ -96,8 +91,8 @@ final class OCRBridge {
 
     /// 冷编译：拉起 `--ocr-warmup`，等它自己跑完退出。
     ///
-    /// 那个进程跑完一次识别就会进入坏状态，但这无所谓 —— 它马上就死了，
-    /// 而编译结果留在系统里，后面的 `--ocr-server` 直接是热的。
+    /// 那个进程只做一次识别，编译结果落在系统里；此后每次新的 `--ocr-server`
+    /// 进程都能在 250ms 量级内直接跑起来。
     private func performWarmup(force: Bool) {
         if !force, OCRWarmMarker.matchesThisBoot() {
             Log.info("OCR bridge: 本次开机已经编译过，跳过冷编译")
@@ -122,6 +117,7 @@ final class OCRBridge {
         if task.isRunning {
             Log.info("OCR bridge: 冷编译超时，杀掉")
             task.terminate()
+            task.waitUntilExit()
         } else {
             Log.info("OCR bridge: 冷编译进程完成 \(Int(-start.timeIntervalSinceNow * 1000))ms，退出码 \(task.terminationStatus)")
         }
@@ -130,11 +126,24 @@ final class OCRBridge {
     private var executableURL: URL {
         Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
     }
-    private func runOnHelper(image: CGImage, enhance: OCR.Enhance) throws -> OCR.Result {
-        let path = try writePNG(image)
-        defer { try? FileManager.default.removeItem(atPath: path) }
 
-        try startHelperIfNeeded()
+    /// 起一个进程、问一次、收工。
+    private func runOnce(path: String, enhance: OCR.Enhance) throws -> OCR.Result {
+        // 用自己这个可执行文件，只是换个参数：同一个二进制，命令行模式，没有 AppKit 事件循环
+        let task = Process()
+        task.executableURL = executableURL
+        task.arguments = ["--ocr-server"]
+        let input = Pipe()
+        let output = Pipe()
+        task.standardInput = input
+        task.standardOutput = output
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+        } catch {
+            throw BridgeError.startFailed(error.localizedDescription)
+        }
+        defer { finish(task, input: input, output: output) }
 
         let request: [String: Any] = [
             "path": path,
@@ -144,32 +153,18 @@ final class OCRBridge {
             throw BridgeError.encodeFailed
         }
         payload.append(0x0A)
+        input.fileHandleForWriting.write(payload)
 
-        let started = Date()
-        do {
-            return try exchange(payload, startedAt: started)
-        } catch BridgeError.helperClosed where Date().timeIntervalSince(started) < timeout {
-            // 进程是刚死的（不是卡住），重启一次再试
-            Log.info("OCR bridge: 独立进程已退出，重启后重试")
-            teardown()
-            try startHelperIfNeeded()
-            return try exchange(payload, startedAt: Date())
-        }
-    }
-
-    private func exchange(_ payload: Data, startedAt: Date) throws -> OCR.Result {
-        guard let toHelper, let fromHelper else { throw BridgeError.helperClosed }
-        toHelper.write(payload)
-
-        // 看门狗：卡住不能无限等，直接杀掉进程让下一次重来
-        let watchdog = DispatchWorkItem { [weak self] in
-            Log.info("OCR bridge: 超时 \(Int(self?.timeout ?? 0)) 秒，杀掉独立进程")
-            self?.teardown()
+        // 看门狗：卡住不能无限等，直接杀掉
+        let watchdog = DispatchWorkItem { [timeout] in
+            Log.info("OCR bridge: 一次性进程超过 \(Int(timeout)) 秒，杀掉")
+            if task.isRunning { task.terminate() }
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
         defer { watchdog.cancel() }
 
-        let line = try readLine(from: fromHelper)
+        let started = Date()
+        let line = try readLine(from: output.fileHandleForReading)
         guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
             throw BridgeError.badReply(String(data: line.prefix(120), encoding: .utf8) ?? "")
         }
@@ -178,8 +173,8 @@ final class OCRBridge {
         }
         let lines = obj["lines"] as? [String] ?? []
         guard !lines.isEmpty else { throw OCR.OCRError.noText }
-        let elapsed = obj["elapsed"] as? Int ?? Int(Date().timeIntervalSince(startedAt) * 1000)
-        Log.info("OCR bridge: 独立进程识别成功 \(lines.count) 行 / \(elapsed)ms")
+        let elapsed = obj["elapsed"] as? Int ?? Int(Date().timeIntervalSince(started) * 1000)
+        Log.info("OCR bridge: 一次性进程识别成功 \(lines.count) 行 / \(elapsed)ms（总 \(Int(Date().timeIntervalSince(started) * 1000))ms）")
         return OCR.Result(lines: lines,
                           text: lines.joined(separator: "\n"),
                           paragraph: obj["paragraph"] as? String ?? lines.joined(separator: " "),
@@ -188,18 +183,29 @@ final class OCRBridge {
                           variant: obj["variant"] as? String ?? "独立进程")
     }
 
-    /// 按行读。Vision 的结果不大，按块读再切行足够。
+    /// 收尾：关 stdin 让子进程读到 EOF 自己退，等一下就回收，不等就杀。
+    private func finish(_ task: Process, input: Pipe, output: Pipe) {
+        input.fileHandleForWriting.closeFile()
+        output.fileHandleForReading.closeFile()
+        let deadline = Date().addingTimeInterval(1.0)
+        while task.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if task.isRunning { task.terminate() }
+        task.waitUntilExit()
+    }
+
+    /// 按行读。
     ///
     /// 必须用 POSIX read：`FileHandle.read(upToCount:)` 会阻塞到读满请求的字节数或 EOF，
-    /// 常驻进程不会关管道，用它就永远等不到响应（这个坑踩过）。
+    /// 对端不关管道就永远等不到响应（这个坑踩过）。
     private func readLine(from handle: FileHandle) throws -> Data {
         let fd = handle.fileDescriptor
         var chunk = [UInt8](repeating: 0, count: 65536)
+        var buffer = Data()
         while true {
             if let index = buffer.firstIndex(of: 0x0A) {
-                let line = buffer[buffer.startIndex..<index]
-                buffer = buffer[(index + 1)...]
-                return Data(line)
+                return Data(buffer[buffer.startIndex..<index])
             }
             let got = Darwin.read(fd, &chunk, chunk.count)
             if got < 0 {
@@ -219,43 +225,6 @@ final class OCRBridge {
         let path = NSTemporaryDirectory() + "peek-ocr-\(UUID().uuidString).png"
         try data.write(to: URL(fileURLWithPath: path))
         return path
-    }
-
-    private func startHelperIfNeeded() throws {
-        if let process, process.isRunning, toHelper != nil, fromHelper != nil { return }
-        teardown()
-
-        // 用自己这个可执行文件，只是换个参数：同一个二进制，命令行模式，没有 AppKit 事件循环
-        let task = Process()
-        task.executableURL = executableURL
-        task.arguments = ["--ocr-server"]
-        let input = Pipe()
-        let output = Pipe()
-        task.standardInput = input
-        task.standardOutput = output
-        task.standardError = FileHandle.nullDevice
-        do {
-            try task.run()
-        } catch {
-            throw BridgeError.startFailed(error.localizedDescription)
-        }
-        process = task
-        toHelper = input.fileHandleForWriting
-        fromHelper = output.fileHandleForReading
-        buffer = Data()
-        Log.info("OCR bridge: 独立进程已启动 pid=\(task.processIdentifier)")
-    }
-
-    private func teardown() {
-        toHelper?.closeFile()
-        fromHelper?.closeFile()
-        toHelper = nil
-        fromHelper = nil
-        buffer = Data()
-        if let process, process.isRunning {
-            process.terminate()
-        }
-        process = nil
     }
 }
 

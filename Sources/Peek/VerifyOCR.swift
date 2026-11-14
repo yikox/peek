@@ -81,9 +81,9 @@ extension Verify {
 
     /// Peek --ocr-warmup：**一次性**冷编译进程，跑完一次就退。
     ///
-    /// 冷编译会把执行它的进程弄坏（第一次调用之后，同一进程里所有识别都报
-    /// `CRImageReaderError 1`），但编译结果会留在系统里。所以让这个进程去踩雷、
-    /// 踩完就死，紧接着启动的 `--ocr-server` 就是干净的、热的。
+    /// Vision 第一次调用要编译模型（实测 13~44 秒）。让这个进程去承担这次编译，
+    /// 编译结果落在系统里，此后每个 `--ocr-server` 新进程 250ms 就能跑起来。
+    /// 冷编译那一次本身也可能慢得离谱，但它跑完就死，不影响别人。
     static func runOCRWarmup() -> Never {
         let start = Date()
         guard let warm = OCR.warmupImage() else {
@@ -101,13 +101,13 @@ extension Verify {
         }
     }
 
-    /// Peek --ocr-server：常驻识别进程，按行收发 JSON。
+    /// Peek --ocr-server：识别子进程，按行收发 JSON。
     ///
-    /// 由 `OCRBridge` 从 GUI 主进程里拉起来。为什么不在主进程里直接识别：
-    /// macOS 27 + 16 GB 机器上，**冷编译**会让执行它的进程进入不可恢复的坏状态
-    /// （三个设备全报 `CRImageReaderError 1`），而冷编译之后新起的进程一切正常。
-    /// 所以这个进程不做预热 —— 它启动时模型通常已经被 `--ocr-warmup` 编译好了；
-    /// 万一没有，第一枪由这次真实请求去踩，代价是一次十几秒的编译。
+    /// 由 `OCRBridge` 从 GUI 主进程里拉起来，**一次识别一个进程**，答完父进程就关管道、
+    /// 本进程读到 EOF 退出。为什么不常驻：Vision 的 e5rt 推理上下文在进程里闲置约
+    /// 20 分钟后会失效（报 `CRImageReaderError 1`），进程内重建不回来；而全新进程
+    /// 在模型已编译的前提下只要 236~248ms。所以永远只做「进程内第一次调用」。
+    /// 循环读 stdin 保留着，方便手工连管道调试多次识别（短时间连续调用是好的）。
     static func runOCRServer() -> Never {
         Log.info("OCR 独立进程: 启动 pid=\(getpid())")
 

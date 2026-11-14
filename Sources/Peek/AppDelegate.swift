@@ -36,9 +36,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.info("剪贴板历史: 记录已关闭，不启动轮询")
         }
 
-        // OCR 冷编译：Vision 第一次调用要编译模型，实测 13~14 秒（热态 200~400ms）。
+        // OCR 冷编译：Vision 第一次调用要编译模型，实测 13~44 秒（编译过之后新进程 250ms）。
         // 登录后立刻在后台做，这样用户第一次按 ⌥S 不用等；编译放在一次性进程里，
-        // 不会污染主进程（见 OCRBridge 的说明）。
+        // 主进程自己一次 Vision 都不碰（见 OCRBridge 的说明）。
         Log.info("OCR: 计算设备 \(OCR.debugDeviceSummary)")
         if PrefKey.prewarmOCRDefault {
             // 不延迟：越早编译完，用户第一次截图越可能赶上热的
@@ -386,9 +386,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 系统唤醒后重新把 OCR 模型拉起来。
-    /// 睡眠期间 ANE 掉电、模型页被回收，旧进程里那份句柄可能已经失效；
-    /// 唤醒后立刻跑一次，成功就顺手重启保活，失败会走诊断日志。
+    /// 系统唤醒后重新做一次冷编译。
+    /// 睡眠期间 ANE 掉电、模型页被回收，编译结果可能已经失效；
+    /// 唤醒后重编一次，让接下来的一次性识别进程还是 250ms 量级。
     /// 关掉预热的人不希望模型常驻，就不替他加载。
     static func launchStatusText(_ status: SMAppService.Status) -> String {
         switch status {
